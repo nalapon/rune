@@ -74,7 +74,7 @@ pub struct Args {
     /// runs after its first frame.
     pub(crate) realtime: bool,
     /// `--term [zlib|base64|shm]`: run inside a terminal with the Kitty graphics protocol,
-    /// sending pixels this way (`term::Transport`).
+    /// sending pixels this way (`term::Transport`); empty picks one (`Transport::auto`).
     pub(crate) term: Option<String>,
     /// `--term-stats`: print where `--term`'s frames spent their time on exit.
     pub(crate) term_stats: bool,
@@ -188,7 +188,7 @@ impl Args {
                 "--term" => {
                     let how = argv.get(i + 1).filter(|v| matches!(v.as_str(), "zlib" | "base64" | "shm")).cloned();
                     if how.is_some() { i += 1; }
-                    a.term = Some(how.unwrap_or_else(|| "zlib".to_owned()));
+                    a.term = Some(how.unwrap_or_default());
                 }
                 "--term-stats" => a.term_stats = true,
                 "--trace-all" => a.trace_all = true,
@@ -300,7 +300,8 @@ const HELP: &str = "usage: <app> [window]
                         print \"rune-mark NAME T\" as the script passes each mark,
                         and run on_ready after the first frame, as a window does
   --term [zlib|base64|shm]  run inside a terminal with the Kitty graphics protocol (Kitty,
-                        Ghostty): zlib (default) works over ssh, shm is fastest locally;
+                        Ghostty): shm by default in a local Ghostty or Kitty, the fastest,
+                        zlib elsewhere, which works over ssh;
                         --scale defaults to the cells' density, --duration S quits after S
                         seconds, --term-stats prints frame timings on exit
   --first-pixels        report when the first GPU-complete offscreen pixels are readable

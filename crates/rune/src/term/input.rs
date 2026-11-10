@@ -1,6 +1,7 @@
-//! Terminal input: the bytes on stdin decoded into keys and pointer events, one byte at a time.
-//! Keys use the legacy encoding every terminal sends; the pointer comes as SGR reports in pixels
-//! (mode 1016).
+//! Terminal input: the bytes on stdin decoded into keys, pastes and pointer events, one byte at
+//! a time. Keys come in the legacy encoding every terminal sends, or as `CSI … u` where the
+//! terminal speaks the Kitty keyboard protocol (Tab and Ctrl-I, Esc and Alt sequences tell apart);
+//! a paste arrives bracketed (mode 2004); the pointer as SGR reports in pixels (mode 1016).
 
 use crate::edit::{Key, KeyEvent, Mods};
 use crate::machine::Effects;
@@ -14,8 +15,10 @@ pub(super) enum Input {
     Up(f32, f32),
     /// Position and notches, positive down.
     Wheel(f32, f32, f32),
-    /// Ctrl-C: the run ends.
-    Interrupt,
+    /// Bracketed paste: the text, as the terminal pasted it.
+    Paste(String),
+    /// Ctrl-\: the run ends, whatever the app does with keys. Ctrl-C goes to the app.
+    Quit,
 }
 
 /// Where the decoder is.
@@ -29,7 +32,12 @@ pub(super) enum Decode {
     Csi(Vec<u8>),
     /// Inside a UTF-8 character that needs `need` bytes in all.
     Utf8 { bytes: Vec<u8>, need: usize },
+    /// Inside a bracketed paste, until `ESC [ 201 ~`.
+    Paste(Vec<u8>),
 }
+
+/// Ends a bracketed paste.
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Feeds one byte.
 pub(super) fn step(state: &mut Decode, b: u8) -> Effects<Input> {
@@ -46,7 +54,20 @@ pub(super) fn step(state: &mut Decode, b: u8) -> Effects<Input> {
                 *state = Decode::Csi(params);
                 return Effects::none();
             }
+            if (params.as_slice(), b) == (b"200".as_slice(), b'~') {
+                *state = Decode::Paste(Vec::new());
+                return Effects::none();
+            }
             csi(&params, b).map_or(Effects::none(), Effects::one)
+        }
+        Decode::Paste(mut bytes) => {
+            bytes.push(b);
+            if bytes.ends_with(PASTE_END) {
+                bytes.truncate(bytes.len() - PASTE_END.len());
+                return Effects::one(Input::Paste(String::from_utf8_lossy(&bytes).into_owned()));
+            }
+            *state = Decode::Paste(bytes);
+            Effects::none()
         }
         Decode::Utf8 { mut bytes, need } => {
             if b & 0xc0 != 0x80 { return ground(state, b, Mods::default()); }
@@ -80,7 +101,7 @@ fn ctrl(mods: Mods) -> Mods {
 fn ground(state: &mut Decode, b: u8, mods: Mods) -> Effects<Input> {
     let input = match b {
         0x1b => { *state = Decode::Esc; return Effects::none(); }
-        0x03 => Input::Interrupt,
+        0x1c => Input::Quit,
         b'\r' | b'\n' => key(Key::Enter, mods),
         b'\t' => key(Key::Tab, mods),
         0x7f | 0x08 => key(Key::Backspace, mods),
@@ -107,6 +128,9 @@ fn csi(params: &[u8], fin: u8) -> Option<Input> {
     if let [b'<', rest @ ..] = params {
         return pointer(rest, fin);
     }
+    if fin == b'u' {
+        return kitty_key(params);
+    }
     let mut nums = std::str::from_utf8(params).ok()?.split(';').map(|p| p.parse::<u32>().ok());
     let (first, mods) = (nums.next().flatten(), csi_mods(nums.next().flatten()));
     let k = match (fin, first) {
@@ -122,6 +146,27 @@ fn csi(params: &[u8], fin: u8) -> Option<Input> {
         (b'~', Some(5)) => Key::PageUp,
         (b'~', Some(6)) => Key::PageDown,
         _ => return None,
+    };
+    Some(key(k, mods))
+}
+
+/// A Kitty keyboard protocol key, `ESC [ code[:alternates] ; mods[:event] u`: a code point,
+/// with Escape, Enter, Tab and Backspace by their C0 codes.
+fn kitty_key(params: &[u8]) -> Option<Input> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut fields = text.split(';');
+    let code: u32 = fields.next()?.split(':').next()?.parse().ok()?;
+    let mods = csi_mods(fields.next().and_then(|m| m.split(':').next()?.parse().ok()));
+    let k = match code {
+        27 => Key::Escape,
+        13 => Key::Enter,
+        9 => Key::Tab,
+        127 | 8 => Key::Backspace,
+        c => {
+            let ch = char::from_u32(c).filter(|ch| !ch.is_control())?;
+            if mods.ctrl && ch == '\\' { return Some(Input::Quit); }
+            Key::Text(ch.to_string())
+        }
     };
     Some(key(k, mods))
 }

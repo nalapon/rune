@@ -1,22 +1,25 @@
-//! Frames as Kitty graphics: the window is one image (id 1) placed at the top-left cell. A new
-//! size transmits it whole (`a=T`); after that each damaged rectangle is written into it in
-//! place (`a=f` on frame 1, the image itself). Each frame is one synchronized update.
+//! Frames as Kitty graphics: the window is one image (id 1) placed at the top-left cell. Through
+//! the pty (zlib, base64) a new size transmits it whole (`a=T`) and after that each damaged
+//! rectangle is written into it in place (`a=f` on frame 1, the image itself), so few bytes cross.
+//! Through shared memory nothing but a name crosses, so every frame replaces the whole image as
+//! RGBA (`a=T`): Ghostty spends far less on that than on `a=f` edits, which cost it about the same
+//! whatever their size, and than on many small images, which cost it per image. Each frame is one
+//! synchronized update.
 
 use std::ffi::CString;
 use std::io::Write;
 
 use super::readback::Patch;
 
-/// How pixels reach the terminal: `--term zlib|base64|shm`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// How pixels reach the terminal: `--term zlib|base64|shm`, or [`Transport::auto`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transport {
-    /// RGB deflated (`o=z`), base64 in the pty. Works over SSH; the default.
-    #[default]
+    /// RGB deflated (`o=z`), base64 in the pty. Works over SSH.
     Zlib,
     /// RGB, base64 in the pty.
     Base64,
     /// A POSIX shared-memory object the terminal maps and unlinks; only its name goes through
-    /// the pty. Local only.
+    /// the pty. Local only; whole RGBA frames.
     Shm,
 }
 
@@ -28,6 +31,21 @@ impl Transport {
             "shm" => Some(Transport::Shm),
             _ => None,
         }
+    }
+
+    /// Without a choice: shared memory in a local Ghostty or Kitty, the fastest by far, and zlib
+    /// anywhere else (SSH, other terminals), which sends only what changed, compressed.
+    pub(crate) fn auto() -> Transport {
+        let set = |k: &str| std::env::var_os(k).is_some();
+        let is = |k: &str, v: &str| std::env::var(k).is_ok_and(|x| x == v);
+        let ssh = set("SSH_CONNECTION") || set("SSH_CLIENT") || set("SSH_TTY");
+        let local = is("TERM_PROGRAM", "ghostty") || is("TERM", "xterm-kitty") || set("KITTY_WINDOW_ID");
+        if local && !ssh { Transport::Shm } else { Transport::Zlib }
+    }
+
+    /// Whether every frame goes whole ([`Transport::Shm`]) rather than as damaged rectangles.
+    pub(crate) fn whole_frames(self) -> bool {
+        self == Transport::Shm
     }
 }
 
@@ -61,15 +79,24 @@ impl Kitty {
         Kitty { transport, shown: None, out: Vec::new(), rgb: Vec::new(), b64: Vec::new(), shm_seq: 0, sent: Sent::default() }
     }
 
-    /// The commands that draw `patches` of a frame `size` pixels big. A frame at a new size must
-    /// be one whole-window patch; one that isn't is dropped (a later full frame replaces it).
+    /// The commands that draw `patches` of a frame `size` pixels big. A frame at a new size, and
+    /// every shared-memory frame, must be one whole-window patch; one that isn't is dropped (a
+    /// later full frame replaces it).
     pub(super) fn frame(&mut self, size: (u32, u32), patches: &[Patch]) -> std::io::Result<&[u8]> {
         self.out.clear();
         let fresh = self.shown != Some(size);
-        if patches.is_empty() || fresh && !matches!(patches, [p] if (p.rect.w, p.rect.h) == size) { return Ok(&self.out); }
+        let whole = matches!(patches, [p] if (p.rect.w, p.rect.h) == size);
+        if patches.is_empty() || (fresh || self.transport.whole_frames()) && !whole { return Ok(&self.out); }
         self.out.extend_from_slice(b"\x1b[?2026h");
         if fresh { self.out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[H"); }
-        for p in patches {
+        if self.transport.whole_frames() {
+            let keys = format!("a=T,f=32,s={},v={},i=1,p=1,q=2,C=1", size.0, size.1);
+            self.transmit_shm(&keys, &patches[0].rgba)?;
+            self.sent.rects += 1;
+            self.sent.pixels += patches[0].rgba.len() as u64;
+        }
+        let rects = if self.transport.whole_frames() { &[][..] } else { patches };
+        for p in rects {
             self.rgb.clear();
             self.rgb.extend(p.rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
             let keys = if fresh {
@@ -88,21 +115,25 @@ impl Kitty {
         Ok(&self.out)
     }
 
-    /// Appends `self.rgb` sent with the command's `keys`.
+    /// Appends `data` sent through a fresh shared-memory object with the command's `keys`.
+    fn transmit_shm(&mut self, keys: &str, data: &[u8]) -> std::io::Result<()> {
+        let name = shm_name(self.shm_seq % SHM_NAMES);
+        self.shm_seq += 1;
+        write_shm(&name, data)?;
+        self.b64.clear();
+        base64(name.as_bytes(), &mut self.b64);
+        write!(self.out, "\x1b_G{keys},t=s,S={};", data.len())?;
+        self.out.extend_from_slice(&self.b64);
+        self.out.extend_from_slice(b"\x1b\\");
+        Ok(())
+    }
+
+    /// Appends `self.rgb` sent through the pty with the command's `keys`.
     fn transmit(&mut self, keys: &str) -> std::io::Result<()> {
         self.b64.clear();
         let out = &mut self.out;
         match self.transport {
-            Transport::Shm => {
-                let name = shm_name(self.shm_seq % SHM_NAMES);
-                self.shm_seq += 1;
-                write_shm(&name, &self.rgb)?;
-                base64(name.as_bytes(), &mut self.b64);
-                write!(out, "\x1b_G{keys},t=s,S={};", self.rgb.len())?;
-                out.extend_from_slice(&self.b64);
-                out.extend_from_slice(b"\x1b\\");
-                return Ok(());
-            }
+            Transport::Shm => unreachable!("shared memory sends whole frames"),
             Transport::Base64 => base64(&self.rgb, &mut self.b64),
             Transport::Zlib => base64(&miniz_oxide::deflate::compress_to_vec_zlib(&self.rgb, 1), &mut self.b64),
         }

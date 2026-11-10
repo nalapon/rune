@@ -35,10 +35,12 @@ impl Size {
     }
 }
 
-/// Alternate screen, hidden cursor, every mouse move reported in pixels (SGR, 1016).
-const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1016h";
+/// Alternate screen, hidden cursor, every mouse move reported in pixels (SGR, 1016), bracketed
+/// paste, and the Kitty keyboard protocol's unambiguous keys (`CSI > 1 u`; terminals without it
+/// ignore it and send legacy keys).
+const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1016h\x1b[?2004h\x1b[>1u";
 /// Deletes every image, then undoes `ENTER`.
-const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l";
+const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[<u\x1b[?2004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l";
 
 /// The wake pipe's write end, for the SIGWINCH handler.
 static RESIZED: AtomicI32 = AtomicI32::new(-1);

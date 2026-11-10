@@ -6,7 +6,8 @@
 //! renders, and `kitty` writes them into the terminal's image. An idle app draws and sends
 //! nothing. `--scale` defaults to 2 when the terminal's cells are at least 30 pixels tall.
 //!
-//! Single-window apps only for now; native menus, file dialogs and pop-up menus aren't there.
+//! Ctrl-C reaches the app as a key; Ctrl-\ always ends the run. Single-window apps only for
+//! now; native menus, file dialogs and pop-up menus aren't there.
 
 mod check;
 mod damage;
@@ -126,6 +127,8 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
     let mut target = Target::new(&gpu.device, size.px(), format);
 
     let tty = Tty::open()?;
+    // The window's title, as a window would show it.
+    tty.write(format!("\x1b]2;{}\x07", spec.title).as_bytes());
     let waker = tty.waker();
     let mut sink = Sink { tty, kitty: Kitty::new(transport), stats: Stats::default(), check: Check::from_env() };
     shared.connect(waker.clone());
@@ -198,10 +201,12 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
         let px = size.px();
         let images_changed = rt.images.pages.iter().any(|p| p.dirty.is_some());
         let clear = rt.clear_color();
-        let rects = match &last {
+        let mut rects = match &last {
             Some((old, old_clear)) if comp.is_none() && rt.surfaces.is_empty() && !images_changed && *old_clear == clear => damage::between(old, &rt.instances, px),
             _ => vec![Rect::whole(px)],
         };
+        // Damage still says whether anything changed; shared memory then sends the whole frame.
+        if transport.whole_frames() && !rects.is_empty() { rects = vec![Rect::whole(px)]; }
         match &mut last {
             Some((old, old_clear)) => { old.clone_from(&rt.instances); *old_clear = clear; }
             None => last = Some((rt.instances.clone(), clear)),
@@ -259,7 +264,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
     Ok(())
 }
 
-/// Hands one input to the runtime; true for Ctrl-C.
+/// Hands one input to the runtime; true for Ctrl-\\, which ends the run.
 fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input, scale: f32) -> bool {
     let p = |v: f32| v / scale;
     match input {
@@ -268,7 +273,8 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input, scale: f32) -> bool {
         Input::Down(x, y) => { rt.pointer_move(p(x), p(y)); rt.pointer_down(p(x), p(y)) }
         Input::Up(x, y) => rt.pointer_up(p(x), p(y)),
         Input::Wheel(x, y, notches) => rt.wheel(p(x), p(y), notches * 40.0),
-        Input::Interrupt => return true,
+        Input::Paste(text) => rt.paste(text),
+        Input::Quit => return true,
     }
     false
 }
