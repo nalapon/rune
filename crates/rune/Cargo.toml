@@ -186,6 +186,10 @@ zbus = { version = "6", default-features = false, features = ["tokio", "proxy", 
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
+[target.'cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))'.dependencies]
+# zlib for `--term`'s Kitty graphics frames.
+miniz_oxide = "0.8"
+
 [target.'cfg(all(not(target_vendor = "apple"), not(target_arch = "wasm32")))'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["vulkan", "dx12"] }
 

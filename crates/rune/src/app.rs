@@ -583,6 +583,12 @@ impl<S: 'static> App<S> {
             Some(argv) => Args::parse_from(argv),
             None => Args::parse(),
         };
+        if let Some(how) = args.term.clone() {
+            #[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
+            return crate::term::run(self, args, crate::term::Transport::parse(&how).unwrap_or_default());
+            #[cfg(not(all(unix, not(any(target_os = "ios", target_os = "android")))))]
+            return Err(format!("--term {how}: needs a Unix terminal"));
+        }
         if args.headless() {
             crate::render::discard_prewarm();
             crate::tooling::try_headless(self, args)

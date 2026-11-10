@@ -28,6 +28,8 @@ mod relaunch;
 mod shortcuts;
 mod states;
 mod system_material;
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
+mod term;
 mod titlebar;
 mod video;
 mod window;

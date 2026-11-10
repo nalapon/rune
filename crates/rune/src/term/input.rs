@@ -1,0 +1,144 @@
+//! Terminal input: the bytes on stdin decoded into keys and pointer events, one byte at a time.
+//! Keys use the legacy encoding every terminal sends; the pointer comes as SGR reports in pixels
+//! (mode 1016).
+
+use crate::edit::{Key, KeyEvent, Mods};
+use crate::machine::Effects;
+
+/// A decoded input. Positions are in pixels.
+#[derive(Debug, PartialEq)]
+pub(super) enum Input {
+    Key(KeyEvent),
+    Move(f32, f32),
+    Down(f32, f32),
+    Up(f32, f32),
+    /// Position and notches, positive down.
+    Wheel(f32, f32, f32),
+    /// Ctrl-C: the run ends.
+    Interrupt,
+}
+
+/// Where the decoder is.
+#[derive(Debug, Default)]
+pub(super) enum Decode {
+    #[default]
+    Ground,
+    /// After ESC: a sequence, Alt with a key, or Escape itself when the read ends here.
+    Esc,
+    /// Inside `ESC [`, with the bytes so far.
+    Csi(Vec<u8>),
+    /// Inside a UTF-8 character that needs `need` bytes in all.
+    Utf8 { bytes: Vec<u8>, need: usize },
+}
+
+/// Feeds one byte.
+pub(super) fn step(state: &mut Decode, b: u8) -> Effects<Input> {
+    match std::mem::take(state) {
+        Decode::Ground => ground(state, b, Mods::default()),
+        Decode::Esc => match b {
+            b'[' => { *state = Decode::Csi(Vec::new()); Effects::none() }
+            0x1b => { *state = Decode::Esc; Effects::one(key(Key::Escape, Mods::default())) }
+            _ => ground(state, b, Mods { alt: true, ..Mods::default() }),
+        },
+        Decode::Csi(mut params) => {
+            if !(0x40..=0x7e).contains(&b) {
+                params.push(b);
+                *state = Decode::Csi(params);
+                return Effects::none();
+            }
+            csi(&params, b).map_or(Effects::none(), Effects::one)
+        }
+        Decode::Utf8 { mut bytes, need } => {
+            if b & 0xc0 != 0x80 { return ground(state, b, Mods::default()); }
+            bytes.push(b);
+            if bytes.len() < need {
+                *state = Decode::Utf8 { bytes, need };
+                return Effects::none();
+            }
+            std::str::from_utf8(&bytes).map_or(Effects::none(), |s| Effects::one(key(Key::Text(s.to_owned()), Mods::default())))
+        }
+    }
+}
+
+/// The read ended: an ESC with nothing after it was the Escape key.
+pub(super) fn idle(state: &mut Decode) -> Effects<Input> {
+    match std::mem::take(state) {
+        Decode::Esc => Effects::one(key(Key::Escape, Mods::default())),
+        other => { *state = other; Effects::none() }
+    }
+}
+
+fn key(key: Key, mods: Mods) -> Input {
+    Input::Key(KeyEvent { key, mods })
+}
+
+/// Ctrl with a letter. Off macOS, Ctrl is also the shortcut modifier (`Mods::cmd`).
+fn ctrl(mods: Mods) -> Mods {
+    Mods { ctrl: true, cmd: cfg!(not(target_os = "macos")), ..mods }
+}
+
+fn ground(state: &mut Decode, b: u8, mods: Mods) -> Effects<Input> {
+    let input = match b {
+        0x1b => { *state = Decode::Esc; return Effects::none(); }
+        0x03 => Input::Interrupt,
+        b'\r' | b'\n' => key(Key::Enter, mods),
+        b'\t' => key(Key::Tab, mods),
+        0x7f | 0x08 => key(Key::Backspace, mods),
+        0x01..=0x1a => key(Key::Text(char::from(b'a' + b - 1).to_string()), ctrl(mods)),
+        0x20..=0x7e => key(Key::Text(char::from(b).to_string()), mods),
+        0xc0..=0xf7 => {
+            let need = if b >= 0xf0 { 4 } else if b >= 0xe0 { 3 } else { 2 };
+            *state = Decode::Utf8 { bytes: vec![b], need };
+            return Effects::none();
+        }
+        _ => return Effects::none(),
+    };
+    Effects::one(input)
+}
+
+/// `1 + bits` in a CSI's modifier parameter: shift 1, alt 2, ctrl 4.
+fn csi_mods(param: Option<u32>) -> Mods {
+    let bits = param.unwrap_or(1).saturating_sub(1);
+    let mods = Mods { shift: bits & 1 != 0, alt: bits & 2 != 0, ..Mods::default() };
+    if bits & 4 != 0 { ctrl(mods) } else { mods }
+}
+
+fn csi(params: &[u8], fin: u8) -> Option<Input> {
+    if let [b'<', rest @ ..] = params {
+        return pointer(rest, fin);
+    }
+    let mut nums = std::str::from_utf8(params).ok()?.split(';').map(|p| p.parse::<u32>().ok());
+    let (first, mods) = (nums.next().flatten(), csi_mods(nums.next().flatten()));
+    let k = match (fin, first) {
+        (b'A', _) => Key::Up,
+        (b'B', _) => Key::Down,
+        (b'C', _) => Key::Right,
+        (b'D', _) => Key::Left,
+        (b'H', _) | (b'~', Some(1 | 7)) => Key::Home,
+        (b'F', _) | (b'~', Some(4 | 8)) => Key::End,
+        (b'Z', _) => return Some(key(Key::Tab, Mods { shift: true, ..Mods::default() })),
+        (b'~', Some(2)) => Key::Insert,
+        (b'~', Some(3)) => Key::Delete,
+        (b'~', Some(5)) => Key::PageUp,
+        (b'~', Some(6)) => Key::PageDown,
+        _ => return None,
+    };
+    Some(key(k, mods))
+}
+
+/// An SGR report, `ESC [ < b ; x ; y M|m`: `b` 64 and up is the wheel, bit 32 a move.
+fn pointer(params: &[u8], fin: u8) -> Option<Input> {
+    let mut n = std::str::from_utf8(params).ok()?.split(';').map(|p| p.parse::<u32>().ok());
+    let (b, x, y) = (n.next()??, n.next()?? as f32, n.next()?? as f32);
+    Some(if b & 64 != 0 {
+        Input::Wheel(x, y, if b & 1 == 0 { -1.0 } else { 1.0 })
+    } else if b & 32 != 0 {
+        Input::Move(x, y)
+    } else if b & 3 != 0 {
+        return None; // Only the primary button presses.
+    } else if fin == b'M' {
+        Input::Down(x, y)
+    } else {
+        Input::Up(x, y)
+    })
+}
