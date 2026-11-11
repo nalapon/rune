@@ -568,7 +568,9 @@ impl<S: 'static> Runtime<S> {
             if turn != 0.0 || self.scene.store().has(id, prop::ROTATION) {
                 self.snap_or_animate(id, prop::ROTATION, turn, rest_quiet, 0.0, nodes[i].vis.rotate_motion.as_deref().copied(), spring_l);
             }
-            let (instant, vis) = (instant || self.enters_unseen(&nodes, &unseen, i), &nodes[i].vis);
+            // On a cell grid colours land at once too: a fade rewrites every cell it covers on
+            // each of its frames, which a terminal paints as flicker.
+            let (instant, vis) = (instant || crate::text::cells_mode() || self.enters_unseen(&nodes, &unseen, i), &nodes[i].vis);
             if !nodes[i].live.iter().any(|b| b.property == crate::live::Property::Blur)
                 && (vis.blur != 0.0 || self.scene.store().has(id, prop::BLUR))
             {

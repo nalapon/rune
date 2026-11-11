@@ -10,7 +10,17 @@
 //! through the terminal too (OSC 52, so they work over SSH), a selection made with the mouse
 //! is copied as the drag ends (the terminal keeps Cmd+C), the window's focus comes in as
 //! focus reports (1004), and without `--theme` the terminal's background picks light or dark
-//! (OSC 11). Motion is settled every frame, so nothing animates.
+//! (OSC 11).
+//!
+//! Changes land at once, as in a terminal UI: layout, entrances, exits and colours
+//! (`cells_mode` makes the whole tree `El::instant_changes` and its colours instant), since text
+//! can't slide between cells and a fade would rewrite every cell it covers on each frame. What
+//! still moves (a scroll glide, an offset the app animates) has its box edges on eighths of a
+//! cell, drawn with the eighth-block characters. While something moves, a cell whose colour
+//! changed too little to see is not rewritten, and frames are paced to what the terminal can
+//! take in bytes (less over SSH); the frame that comes to rest writes every cell exactly.
+//! Changes that come closer together than a frame share one, and a frame with nothing new
+//! writes nothing.
 
 mod grid;
 
@@ -29,8 +39,12 @@ use crate::time::Instant;
 use crate::tooling::{Args, Length, runtime_for};
 use crate::{Family, TextStyle};
 
-/// The fastest the loop draws while input is still being handled.
-const FRAME_GAP: Duration = Duration::from_micros(8_333);
+/// The fastest the loop draws: 60 frames a second.
+const FRAME_GAP: Duration = Duration::from_micros(16_667);
+/// Bytes a second motion may write to a local terminal, and over SSH.
+const MOTION_BYTES: [f64; 2] = [8e6, 1e6];
+/// The biggest step, per sRGB channel (of 255), a cell's colours may lag while things move.
+const MOTION_TOLERANCE: u8 = 6;
 /// Rows one wheel notch scrolls.
 const WHEEL_ROWS: f32 = 3.0;
 /// How long the terminal gets to answer the start-up queries.
@@ -125,7 +139,6 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
     clipboard.connect(waker.clone());
     let mut rt: Runtime<S> = runtime_for(&spec, state, (cols as f32, rows as f32), Env::new(dark, 1.0), waker);
     crate::text::set_cell_font(cell_font_size(&mut rt));
-    rt.set_system_reduced_motion(true);
     rt.set_os_drag(false);
     rt.record_events = false;
     rt.open_urls_natively = true;
@@ -145,13 +158,18 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
     let mut out = Vec::new();
     let mut quit = early.into_iter().fold(false, |q, i| apply(&mut rt, i) || q);
     let (mut asked, mut busy, mut last_frame) = (true, false, started);
+    // The caret the terminal shows.
+    let mut shown_caret: Option<Caret> = None;
+    // The wait between frames while busy: longer for motion that writes a lot.
+    let mut gap = FRAME_GAP;
+    let budget = MOTION_BYTES[usize::from(std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some())];
     let (mut frames, mut bytes, mut cpu, mut drawing) = (0u64, 0u64, Duration::ZERO, Duration::ZERO);
 
     while !quit {
         if quit_after.is_some_and(|d| started.elapsed() >= d) || crate::quit::quitting() { break; }
         let now = Instant::now();
-        let mut timeout = if asked { Some(Duration::ZERO) }
-            else if busy { Some(FRAME_GAP.saturating_sub(now - last_frame)) }
+        let mut timeout = if asked { Some(FRAME_GAP.saturating_sub(now - last_frame)) }
+            else if busy { Some(gap.saturating_sub(now - last_frame)) }
             else { rt.wake_deadline().map(|d| Duration::from_secs_f64((d - (now - started).as_secs_f64()).max(0.0))) };
         if let Some(d) = quit_after { timeout = Some(timeout.map_or(d, |t| t.min(d.saturating_sub(started.elapsed())))); }
         let n = tty.wait(timeout, &mut buf);
@@ -182,7 +200,9 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
 
         let now = Instant::now();
         let due = rt.wake_deadline().is_some_and(|d| d <= (now - started).as_secs_f64());
-        if !(asked || due || busy && now - last_frame >= FRAME_GAP) { continue; }
+        let since = now - last_frame;
+        // Changes that come within a frame of the last one wait and share the next.
+        if !((asked || due) && since >= FRAME_GAP || busy && since >= gap) { continue; }
         asked = false;
         last_frame = now;
 
@@ -197,9 +217,6 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
         clipboard.flush(&mut rt);
         if rt.popup_menu().is_some() { rt.cancel_popups(); }
         rt.refuse_file_dialog("native file dialogs are unsupported in a terminal");
-        // Every change lands at once: no springs, fades or transitions on a character grid.
-        rt.settle_all();
-        // What starts during the frame (a press's colour) settles on the next one.
         let (moving, _) = clock.advance(&mut rt, now, false);
         if rt.shell_request.take().is_some() { break; }
 
@@ -213,18 +230,25 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
         }
         let caret: Option<Caret> = rt.cell_caret().map(|([x, y], c)| ((x.round() as i32, y.round() as i32), rgb(c)))
             .filter(|&((x, y), _)| x >= 0 && y >= 0 && x < grid.w && y < grid.h);
-        grid::encode(shown.as_ref(), &grid, &strings, caret, &mut out);
+        let tolerance = if moving { MOTION_TOLERANCE } else { 0 };
+        let start = out.len();
+        let wrote = grid::encode(shown.as_ref(), &mut grid, &strings, caret, tolerance, &mut out);
+        // Nothing new on screen: send nothing rather than an empty update.
+        if !wrote && shown.is_some() && caret == shown_caret { out.truncate(start); }
+        shown_caret = caret;
         let shape = cursor_name(&rt.cursor());
         if shape != pointer {
             pointer = shape;
             out.extend_from_slice(format!("\x1b]22;{shape}\x1b\\").as_bytes());
         }
-        tty.write(&out);
+        if !out.is_empty() { tty.write(&out); }
         shown = Some(grid);
         clock.presented(&mut rt, Instant::now());
         (frames, bytes, cpu, drawing) = (frames + 1, bytes + out.len() as u64, cpu + now.elapsed(), drawing + drawn.elapsed());
         if let Some(mut ready) = on_ready.take() { ready(&crate::WindowHandle::new("main")); }
-        busy = moving || rt.has_pending_input() || rt.live_pending();
+        let input = rt.has_pending_input() || rt.live_pending();
+        busy = moving || input;
+        gap = if input { FRAME_GAP } else { FRAME_GAP.max(Duration::from_secs_f64(out.len() as f64 / budget)) };
     }
     drop(tty);
     if args.term_stats {

@@ -301,6 +301,17 @@ fn inherit_hover_within(
 }
 
 #[inline]
+/// Whether a node lands its changes because what holds it does (`El::instant_changes`). On a
+/// terminal's character grid (`--term cells`) the whole tree does: a cell holds one character,
+/// so text can't slide between cells or fade over other text. Layout, entrances and exits land
+/// at once there, as in a terminal UI (colours too, in `commit/apply.rs`).
+pub(super) fn inherits_instant_changes(parent: Option<usize>, nodes: &[Node]) -> bool {
+    match parent {
+        Some(p) => nodes[p].instant_changes,
+        None => crate::text::cells_mode(),
+    }
+}
+
 fn node_cold_needed(c: &NodeCold) -> bool {
     let base = c.trace_name.is_some()
         || c.trace_namespace.is_some()
@@ -401,7 +412,7 @@ fn flatten_owned(
     } else {
         in_row
     };
-    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || parent.is_some_and(|p| nodes[p].instant_changes);
+    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || inherits_instant_changes(parent, nodes);
     let trace_namespace = el.cold.trace_namespace.or_else(|| parent.and_then(|p| nodes[p].trace_namespace));
     let role = el.role_name();
     let parent_flow = parent.map_or(crate::el::Flow::Ltr, |p| nodes[p].flow);
@@ -604,7 +615,7 @@ fn flatten_ref(
     } else {
         in_row
     };
-    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || parent.is_some_and(|p| nodes[p].instant_changes);
+    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || inherits_instant_changes(parent, nodes);
     let trace_namespace = el.cold.trace_namespace.or_else(|| parent.and_then(|p| nodes[p].trace_namespace));
     let mut style: Cow<'_, CompactStyle> = Cow::Borrowed(&el.style);
     if let Some(sx) = parent_sx {

@@ -466,7 +466,7 @@ pub(super) fn inherited_for(
     foreground: Option<Color>,
 ) -> (InheritedFlatten, Option<Rc<(Anim, Anim)>>) {
     let parent_is_stack = parent.is_some_and(|p| nodes[p].growth.is_some());
-    let instant_changes = parent.is_some_and(|p| nodes[p].instant_changes);
+    let instant_changes = super::flatten::inherits_instant_changes(parent, nodes);
     let inert = parent.is_some_and(|p| nodes[p].inert);
     let trace_namespace = parent.and_then(|p| nodes[p].trace_namespace);
     let hover_within = parent.and_then(|p| nodes[p].hover_within.clone());

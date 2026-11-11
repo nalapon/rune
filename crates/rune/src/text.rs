@@ -159,7 +159,8 @@ pub(crate) fn cell_font() -> Option<f32> {
 
 /// Whether the app runs on a terminal's character grid (`--term cells`): one layout unit is one
 /// cell, every text is the terminal's monospace, one unit per character and per line, and
-/// nothing animates. Views that draw differently there (whole-cell sizes, no shadows) ask this.
+/// layout and colour changes land at once. Views that draw differently there
+/// (whole-cell sizes, no shadows) ask this.
 pub fn cells_mode() -> bool {
     cell_font().is_some()
 }

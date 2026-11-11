@@ -162,10 +162,57 @@ impl Grid {
         }
     }
 
+    /// `color` over the fractional rect `[x0, y0, x1, y1]` (already inside the clip): whole cells
+    /// as `fill` does, and an edge that stops partway through a cell as an eighth block, the
+    /// covered part in the fill and the rest in what was there. A translucent fill tints an
+    /// edge cell by how much of it it covers.
+    fn fill_fine(&mut self, [x0, y0, x1, y1]: [f32; 4], color: Color) {
+        /// Lower and left eighth blocks, one to seven eighths.
+        const LOWER: [char; 7] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+        const LEFT: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+        let c = rgb(color);
+        let (cx0, cy0) = (x0.floor().max(0.0) as i32, y0.floor().max(0.0) as i32);
+        let (cx1, cy1) = ((x1.ceil() as i32).min(self.w), (y1.ceil() as i32).min(self.h));
+        for y in cy0..cy1 {
+            let cover_y = (y1.min(y as f32 + 1.0) - y0.max(y as f32)).clamp(0.0, 1.0);
+            for x in cx0..cx1 {
+                let cover_x = (x1.min(x as f32 + 1.0) - x0.max(x as f32)).clamp(0.0, 1.0);
+                if color.a < 0.99 {
+                    let a = color.a * cover_x * cover_y;
+                    let cell = self.at(x, y);
+                    (cell.bg, cell.fg, cell.under) = (mix(cell.bg, c, a), mix(cell.fg, c, a), mix(cell.under, c, a));
+                    continue;
+                }
+                let eighths = |v: f32| (v * 8.0).round() as usize;
+                // The partial axis picks the block; a corner partial on both is filled when over half covered.
+                let (vertical, k) = match (eighths(cover_x), eighths(cover_y)) {
+                    (0, _) | (_, 0) => continue,
+                    (8, 8) => { *self.at(x, y) = Cell::blank(c); continue; }
+                    (8, k) => (true, k),
+                    (k, 8) => (false, k),
+                    (kx, ky) if kx * ky < 32 => continue,
+                    _ => { *self.at(x, y) = Cell::blank(c); continue; }
+                };
+                self.unsplit(x, y);
+                let under = self.at(x, y).bg;
+                // Blocks grow from the bottom and the left. A fill covering the cell's top (it ends
+                // inside it) or its right (it starts inside it) draws the uncovered rest as the
+                // block, in the old colour, over the fill.
+                let rest = if vertical { y1 < y as f32 + 1.0 } else { x0 > x as f32 };
+                let (n, fg, bg) = if rest { (8 - k, under, c) } else { (k, c, under) };
+                let blocks = if vertical { &LOWER } else { &LEFT };
+                *self.at(x, y) = Cell { ch: Ch::One(blocks[n - 1]), fg, ..Cell::blank(bg) };
+            }
+        }
+    }
+
     pub(super) fn draw(&mut self, p: &CellPaint, strings: &mut Strings, image: Option<Texels>) {
         let cells = self.span(p.rect, p.clip);
         let [x0, y0, x1, y1] = cells;
-        for &c in &p.fills { self.fill(cells, c); }
+        let fine = [p.rect[0].max(p.clip[0]), p.rect[1].max(p.clip[1]), p.rect[2].min(p.clip[2]), p.rect[3].min(p.clip[3])];
+        for &c in &p.fills {
+            if p.moving { self.fill_fine(fine, c) } else { self.fill(cells, c) }
+        }
         if let Some([top, bottom]) = p.gradient {
             let h = (p.rect[3] - p.rect[1]).max(1.0);
             for y in y0..y1 {
@@ -265,17 +312,30 @@ pub(super) type Caret = ((i32, i32), Rgb);
 /// The bytes that turn `prev` (None: whatever is on screen) into `next`: only changed cells,
 /// one cursor move per run of them, a style change only where the pen changes, hyperlinks
 /// opened and closed around their cells. Then the caret, as the terminal's bar cursor in its
-/// colour, or no cursor.
-pub(super) fn encode(prev: Option<&Grid>, next: &Grid, strings: &Strings, caret: Option<Caret>, out: &mut Vec<u8>) {
+/// colour, or no cursor. Returns whether any cell was written.
+///
+/// With a `tolerance`, a cell that only changed colour, by at most that much per channel, is
+/// left as it is on screen, and `next` takes the shown cell back so later frames compare with
+/// what the terminal shows.
+pub(super) fn encode(prev: Option<&Grid>, next: &mut Grid, strings: &Strings, caret: Option<Caret>, tolerance: u8, out: &mut Vec<u8>) -> bool {
+    let close = |a: Rgb, b: Rgb| a.iter().zip(b).all(|(&a, b)| a.abs_diff(b) <= tolerance);
     out.extend_from_slice(b"\x1b[?2026h");
     let mut pen: Option<(Rgb, Rgb, Attrs, Rgb)> = None;
     let mut link = 0;
     let mut cursor: Option<(i32, i32)> = None;
+    let mut wrote = false;
     for y in 0..next.h {
         for x in 0..next.w {
             let i = (y * next.w + x) as usize;
+            if let Some(p) = prev && tolerance > 0 {
+                let (was, now) = (&p.cells[i], &next.cells[i]);
+                if (was.ch, was.attrs, was.link) == (now.ch, now.attrs, now.link) && close(was.fg, now.fg) && close(was.bg, now.bg) && close(was.under, now.under) {
+                    next.cells[i] = *was;
+                }
+            }
             let cell = &next.cells[i];
             if cell.ch == Ch::Wide || prev.is_some_and(|p| p.cells[i] == *cell) { continue; }
+            wrote = true;
             if cursor != Some((x, y)) { let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); }
             if cell.link != link {
                 link = cell.link;
@@ -312,4 +372,5 @@ pub(super) fn encode(prev: Option<&Grid>, next: &Grid, strings: &Strings, caret:
         None => out.extend_from_slice(b"\x1b[?25l"),
     }
     out.extend_from_slice(b"\x1b[?2026l");
+    wrote
 }

@@ -5,6 +5,7 @@
 //! blocks, a scroll viewport that overflows a thumb on its right edge, and text characters with
 //! their weight, slant, underline, strike, span and highlight backgrounds, selection and links.
 //! Radius shows only as round corners; shadows, blur, vector shapes and icons have no cell form.
+//! An element still in motion says so (`moving`), so its fills take fractional edges.
 use super::*;
 use parley::PositionedLayoutItem;
 use std::rc::Rc;
@@ -23,6 +24,10 @@ pub(crate) struct CellPaint {
     pub(crate) border: Option<CellBorder>,
     pub(crate) image: Option<CellImage>,
     pub(crate) glyphs: Vec<CellGlyph>,
+    /// It is on its way somewhere (a track of its own or an ancestor's is still running): its
+    /// rect is fractional on purpose, and its fills draw their edges on eighths of a cell. At
+    /// rest a rect is rounded to cells.
+    pub(crate) moving: bool,
 }
 
 /// A border as a line of box-drawing characters on the rect's outer cells.
@@ -195,7 +200,8 @@ impl<S: 'static> Runtime<S> {
         });
         let mut glyphs = if n.vis.icon.is_some() { Vec::new() } else { self.cell_glyphs(i, rect, opacity, sel) };
         self.cell_scroll_thumb(i, rect, opacity, &mut glyphs);
-        Some(CellPaint { rect, clip, fills, gradient, border, image, glyphs })
+        let moving = self.scene.rest(n.id).is_some();
+        Some(CellPaint { rect, clip, fills, gradient, border, image, glyphs, moving })
     }
 
     /// A vertical scroll viewport whose content overflows shows where it is as a thumb in its
