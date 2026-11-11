@@ -46,8 +46,8 @@ impl Size {
 /// paste, and the Kitty keyboard protocol's unambiguous keys (`CSI > 1 u`; terminals without it
 /// ignore it and send legacy keys).
 const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1016h\x1b[?2004h\x1b[>1u";
-/// Deletes every image, then undoes `ENTER`.
-const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[<u\x1b[?2004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l";
+/// Deletes every image, puts the pointer shape back (OSC 22), then undoes `ENTER`.
+const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b]22;default\x1b\\\x1b[<u\x1b[?2004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l";
 /// `ENTER` for a character grid (`--term cells`): mouse reports in cells, not pixels, and
 /// focus reports (1004).
 const ENTER_CELLS: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>1u";

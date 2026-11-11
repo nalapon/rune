@@ -6,7 +6,8 @@
 //! renders, and `kitty` writes them into the terminal's image. An idle app draws and sends
 //! nothing. `--scale` defaults to 2 when the terminal's cells are at least 30 pixels tall.
 //!
-//! Ctrl-C reaches the app as a key; Ctrl-\ always ends the run. Single-window apps only for
+//! The pointer takes the shape the element under it asks for (OSC 22). Ctrl-C reaches the app
+//! as a key; Ctrl-\ always ends the run. Single-window apps only for
 //! now; native menus, file dialogs and pop-up menus aren't there.
 
 mod cells;
@@ -24,6 +25,7 @@ pub(crate) use kitty::Transport;
 
 use crate::app::App;
 use crate::compose::Frame;
+use crate::el::Cursor;
 use crate::frame::clock::FrameClock;
 use crate::render::{Gpu, Instance, OFFSCREEN_FORMAT, Renderer};
 use crate::runtime::{Env, Runtime};
@@ -84,6 +86,24 @@ impl Sink {
             if let Some(c) = self.check.as_mut() { c.sent(tag.size, &patches); }
         }
         Ok(())
+    }
+}
+
+/// The OSC 22 name of a pointer shape (the CSS cursor names terminals take).
+pub(super) fn cursor_name(c: &Cursor) -> &'static str {
+    match c {
+        Cursor::Pointer => "pointer",
+        Cursor::Text => "text",
+        Cursor::Grab => "grab",
+        Cursor::Grabbing => "grabbing",
+        Cursor::NotAllowed => "not-allowed",
+        Cursor::Move => "move",
+        Cursor::ResizeColumn => "col-resize",
+        Cursor::ResizeRow => "row-resize",
+        Cursor::Crosshair => "crosshair",
+        Cursor::ZoomIn => "zoom-in",
+        Cursor::ZoomOut => "zoom-out",
+        _ => "default",
     }
 }
 
@@ -152,6 +172,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
     // a resize, so the next frame sends everything.
     let mut last: Option<(Vec<Instance>, [f32; 4])> = None;
     let (mut asked, mut animating, mut last_frame) = (true, false, started);
+    let mut pointer = "default";
 
     loop {
         if quit_after.is_some_and(|d| started.elapsed() >= d) || crate::quit::quitting() { break; }
@@ -244,6 +265,11 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
             sink.check.as_mut().unwrap().compare(&gpu.device);
         }
         if let Some(mut ready) = on_ready.take() { ready(&crate::WindowHandle::new("main")); }
+        let shape = cursor_name(&rt.cursor());
+        if shape != pointer {
+            pointer = shape;
+            sink.tty.write(format!("\x1b]22;{shape}\x1b\\").as_bytes());
+        }
 
         animating = moving || comp.as_ref().is_some_and(|c| c.animating()) || rt.has_pending_input() || rt.live_pending();
         // At rest nothing renders next, so finish the frames in flight now.
@@ -274,7 +300,9 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input, scale: f32) -> bool {
         Input::Move(x, y) => rt.pointer_move(p(x), p(y)),
         Input::Down(x, y) => { rt.pointer_move(p(x), p(y)); rt.pointer_down(p(x), p(y)) }
         Input::Up(x, y) => rt.pointer_up(p(x), p(y)),
-        Input::Wheel(x, y, notches) => rt.wheel(p(x), p(y), notches * 40.0),
+        // As a window's wheel: `on_wheel` handlers hear it before a scroll view moves. A notch
+        // down moves the content up (negative `dy`).
+        Input::Wheel(x, y, notches) => rt.wheel_event(crate::WheelEvent::new(0.0, -notches * 40.0).at(p(x), p(y))),
         Input::Paste(text) => rt.paste(text),
         Input::Quit => return true,
         Input::Focus(focused) => rt.window_focus(focused),

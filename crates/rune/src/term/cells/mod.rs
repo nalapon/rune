@@ -32,7 +32,6 @@ use super::input::{self, Decode, Input};
 use super::tty::{Size, Tty};
 use crate::app::App;
 use crate::color::Color;
-use crate::el::Cursor;
 use crate::frame::clock::FrameClock;
 use crate::runtime::{Env, Runtime};
 use crate::time::Instant;
@@ -82,24 +81,6 @@ fn dark_background(tty: &Tty, decode: &mut Decode, early: &mut Vec<Input>) -> Op
 
 fn rgb_luminance([r, g, b]: [u8; 3]) -> f32 {
     (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
-}
-
-/// The OSC 22 name of a pointer shape (the CSS cursor names terminals take).
-fn cursor_name(c: &Cursor) -> &'static str {
-    match c {
-        Cursor::Pointer => "pointer",
-        Cursor::Text => "text",
-        Cursor::Grab => "grab",
-        Cursor::Grabbing => "grabbing",
-        Cursor::NotAllowed => "not-allowed",
-        Cursor::Move => "move",
-        Cursor::ResizeColumn => "col-resize",
-        Cursor::ResizeRow => "row-resize",
-        Cursor::Crosshair => "crosshair",
-        Cursor::ZoomIn => "zoom-in",
-        Cursor::ZoomOut => "zoom-out",
-        _ => "default",
-    }
 }
 
 /// Images' pixels at the size their cells sample them, by signature and size.
@@ -236,7 +217,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
         // Nothing new on screen: send nothing rather than an empty update.
         if !wrote && shown.is_some() && caret == shown_caret { out.truncate(start); }
         shown_caret = caret;
-        let shape = cursor_name(&rt.cursor());
+        let shape = super::cursor_name(&rt.cursor());
         if shape != pointer {
             pointer = shape;
             out.extend_from_slice(format!("\x1b]22;{shape}\x1b\\").as_bytes());
@@ -269,7 +250,9 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input) -> bool {
         Input::Move(x, y) => rt.pointer_move(p(x), p(y)),
         Input::Down(x, y) => { rt.pointer_move(p(x), p(y)); rt.pointer_down(p(x), p(y)) }
         Input::Up(x, y) => rt.pointer_up(p(x), p(y)),
-        Input::Wheel(x, y, notches) => rt.wheel(p(x), p(y), notches * WHEEL_ROWS),
+        // As a window's wheel: `on_wheel` handlers hear it before a scroll view moves. A notch
+        // down moves the content up (negative `dy`).
+        Input::Wheel(x, y, notches) => rt.wheel_event(crate::WheelEvent::new(0.0, -notches * WHEEL_ROWS).at(p(x), p(y))),
         Input::Paste(text) => rt.paste(text),
         Input::Focus(focused) => rt.window_focus(focused),
         Input::Background(_) | Input::Answered => {}
