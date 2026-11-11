@@ -126,6 +126,9 @@ mod playground_host;
 mod scroll_bottom;
 #[path = "runtime/selection/caret.rs"]
 mod caret;
+#[path = "runtime/cells.rs"]
+mod cells;
+pub(crate) use cells::{CellBorder, CellGlyph, CellImage, CellLine, CellPaint, CellText};
 #[path = "runtime/event_log.rs"]
 pub(crate) mod event_log;
 #[path = "runtime/layout_read.rs"]

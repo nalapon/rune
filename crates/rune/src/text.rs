@@ -142,6 +142,28 @@ fn rasterize_color(scaler: &mut swash::scale::Scaler<'_>, glyph: u16) -> Option<
 
 // ---------------------------------------------------------------------------------------------
 
+/// `--term cells`: the font size (bits of an f32) at which the mono family advances exactly one
+/// layout unit per character; 0 when off. Every text then lays out on the terminal's grid.
+static CELL_FONT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Lays every text out on a grid of one-unit cells, at `size` in the mono family.
+pub(crate) fn set_cell_font(size: f32) {
+    CELL_FONT.store(size.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The cell-mode font size, when on.
+pub(crate) fn cell_font() -> Option<f32> {
+    let bits = CELL_FONT.load(std::sync::atomic::Ordering::Relaxed);
+    (bits != 0).then(|| f32::from_bits(bits))
+}
+
+/// Whether the app runs on a terminal's character grid (`--term cells`): one layout unit is one
+/// cell, every text is the terminal's monospace, one unit per character and per line, and
+/// nothing animates. Views that draw differently there (whole-cell sizes, no shadows) ask this.
+pub fn cells_mode() -> bool {
+    cell_font().is_some()
+}
+
 pub struct TextSystem {
     font_cx: FontContext,
     layout_cx: LayoutContext<Ink>,

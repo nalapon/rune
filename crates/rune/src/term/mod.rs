@@ -9,6 +9,7 @@
 //! Ctrl-C reaches the app as a key; Ctrl-\ always ends the run. Single-window apps only for
 //! now; native menus, file dialogs and pop-up menus aren't there.
 
+mod cells;
 mod check;
 mod damage;
 mod input;
@@ -18,6 +19,7 @@ mod tty;
 
 use std::time::Duration;
 
+pub(crate) use cells::run as run_cells;
 pub(crate) use kitty::Transport;
 
 use crate::app::App;
@@ -126,7 +128,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
     renderer.set_srgb_blend(srgb_blend);
     let mut target = Target::new(&gpu.device, size.px(), format);
 
-    let tty = Tty::open()?;
+    let tty = Tty::open(false)?;
     // The window's title, as a window would show it.
     tty.write(format!("\x1b]2;{}\x07", spec.title).as_bytes());
     let waker = tty.waker();
@@ -275,6 +277,8 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input, scale: f32) -> bool {
         Input::Wheel(x, y, notches) => rt.wheel(p(x), p(y), notches * 40.0),
         Input::Paste(text) => rt.paste(text),
         Input::Quit => return true,
+        Input::Focus(focused) => rt.window_focus(focused),
+        Input::Background(_) | Input::Answered => {}
     }
     false
 }

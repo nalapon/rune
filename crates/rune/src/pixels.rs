@@ -122,6 +122,28 @@ impl Pixels {
         (self.id, frame.generation)
     }
 
+    /// The image as straight-alpha sRGB RGBA8, from its smallest stored size of at least
+    /// `w` × `h` texels (the full size when none is that small), for a reader that samples it on
+    /// the CPU (`--term cells`). None while it has no pixels.
+    pub(crate) fn read_at_least(&self, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let frame = self.frame.lock().unwrap();
+        let Some(mips) = &frame.mips else {
+            return (frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty()).then(|| (frame.width, frame.height, frame.rgba.clone()));
+        };
+        let mip = mips.mips.iter().rev().find(|m| m.width >= w && m.height >= h).or(mips.mips.first())?;
+        // Mips hold sRGB-encoded linear-premultiplied colour: undo the premultiplication.
+        let mut rgba = mip.pixels.clone();
+        for px in rgba.chunks_exact_mut(4) {
+            let a = f32::from(px[3]) / 255.0;
+            if a <= 0.0 || a >= 1.0 { continue; }
+            for v in &mut px[..3] {
+                let linear = crate::color::srgb_decode(f32::from(*v) / 255.0) / a;
+                *v = (crate::color::srgb_encode(linear.min(1.0)) * 255.0).round() as u8;
+            }
+        }
+        Some((mip.width, mip.height, rgba))
+    }
+
     #[cfg(test)]
     pub(crate) fn rgba(&self) -> Vec<u8> {
         self.frame.lock().unwrap().rgba.clone()

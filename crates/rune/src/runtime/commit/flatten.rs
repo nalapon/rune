@@ -184,6 +184,15 @@ fn prepare_text(
     scale: f32,
     flow: Option<crate::el::Flow>,
 ) -> (Option<u64>, bool) {
+    // On a terminal's grid every text is one mono size: a character and a line are one unit.
+    if let Some(size) = crate::text::cell_font() && let Some(t) = text
+        && (t.style.size != size || t.style.family != crate::Family::SystemMono || t.style.line_height != 1.0 || t.spans.iter().any(|s| s.size.is_some() || s.mono))
+    {
+        let t: &mut TextSpec = t;
+        t.style = crate::TextStyle { size, family: crate::Family::SystemMono, line_height: 1.0, tracking: 0.0, ..t.style };
+        for s in &mut t.spans { s.size = None; s.mono = false; }
+        t.shape = None;
+    }
     if let Some(t) = text && t.flow != flow {
         t.flow = flow;
         t.shape = None;

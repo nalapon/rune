@@ -322,6 +322,7 @@ pub use text::LinkPaint;
 pub use text::Span;
 pub use text::TextCase;
 pub use text::TextHighlight;
+pub use text::cells_mode;
 pub use theme::Theme;
 pub use time::LocalTime;
 pub use titlebar::ChromeInsets;

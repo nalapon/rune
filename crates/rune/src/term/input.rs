@@ -1,7 +1,9 @@
 //! Terminal input: the bytes on stdin decoded into keys, pastes and pointer events, one byte at
 //! a time. Keys come in the legacy encoding every terminal sends, or as `CSI … u` where the
 //! terminal speaks the Kitty keyboard protocol (Tab and Ctrl-I, Esc and Alt sequences tell apart);
-//! a paste arrives bracketed (mode 2004); the pointer as SGR reports in pixels (mode 1016).
+//! a paste arrives bracketed (mode 2004); the pointer as SGR reports in pixels (mode 1016), or
+//! in cells; focus as `CSI I` and `CSI O` (mode 1004); and the terminal's answers to queries
+//! (its background colour, its device attributes) as OSC and CSI replies.
 
 use crate::edit::{Key, KeyEvent, Mods};
 use crate::machine::Effects;
@@ -19,6 +21,13 @@ pub(super) enum Input {
     Paste(String),
     /// Ctrl-\: the run ends, whatever the app does with keys. Ctrl-C goes to the app.
     Quit,
+    /// The terminal's window gained (true) or lost focus.
+    Focus(bool),
+    /// The answer to `OSC 11 ; ?`: the terminal's background, sRGB.
+    Background([u8; 3]),
+    /// The answer to a device attributes query (`CSI c`), which every terminal answers: the
+    /// replies to the queries sent before it have all arrived.
+    Answered,
 }
 
 /// Where the decoder is.
@@ -34,6 +43,8 @@ pub(super) enum Decode {
     Utf8 { bytes: Vec<u8>, need: usize },
     /// Inside a bracketed paste, until `ESC [ 201 ~`.
     Paste(Vec<u8>),
+    /// Inside `ESC ]`, until BEL or `ESC \\`; `esc` after an ESC in it.
+    Osc { bytes: Vec<u8>, esc: bool },
 }
 
 /// Ends a bracketed paste.
@@ -45,6 +56,7 @@ pub(super) fn step(state: &mut Decode, b: u8) -> Effects<Input> {
         Decode::Ground => ground(state, b, Mods::default()),
         Decode::Esc => match b {
             b'[' => { *state = Decode::Csi(Vec::new()); Effects::none() }
+            b']' => { *state = Decode::Osc { bytes: Vec::new(), esc: false }; Effects::none() }
             0x1b => { *state = Decode::Esc; Effects::one(key(Key::Escape, Mods::default())) }
             _ => ground(state, b, Mods { alt: true, ..Mods::default() }),
         },
@@ -59,6 +71,12 @@ pub(super) fn step(state: &mut Decode, b: u8) -> Effects<Input> {
                 return Effects::none();
             }
             csi(&params, b).map_or(Effects::none(), Effects::one)
+        }
+        Decode::Osc { mut bytes, esc } => {
+            if b == 0x07 || esc && b == b'\\' { return osc(&bytes).map_or(Effects::none(), Effects::one); }
+            if b != 0x1b { bytes.push(b); }
+            *state = Decode::Osc { bytes, esc: b == 0x1b };
+            Effects::none()
         }
         Decode::Paste(mut bytes) => {
             bytes.push(b);
@@ -85,6 +103,8 @@ pub(super) fn step(state: &mut Decode, b: u8) -> Effects<Input> {
 pub(super) fn idle(state: &mut Decode) -> Effects<Input> {
     match std::mem::take(state) {
         Decode::Esc => Effects::one(key(Key::Escape, Mods::default())),
+        // ESC ] with nothing after it in the read was Alt+], not a reply.
+        Decode::Osc { bytes, .. } if bytes.is_empty() => Effects::one(key(Key::Text("]".into()), Mods { alt: true, ..Mods::default() })),
         other => { *state = other; Effects::none() }
     }
 }
@@ -124,9 +144,26 @@ fn csi_mods(param: Option<u32>) -> Mods {
     if bits & 4 != 0 { ctrl(mods) } else { mods }
 }
 
+/// An OSC reply: only `11 ; rgb:R/G/B`, each 1 to 4 hex digits, is read.
+fn osc(bytes: &[u8]) -> Option<Input> {
+    let rgb = std::str::from_utf8(bytes).ok()?.strip_prefix("11;rgb:")?;
+    let mut parts = rgb.split('/').map(|h| {
+        let v = u32::from_str_radix(h, 16).ok()?;
+        let max = (1u32 << (4 * h.len().clamp(1, 4))) - 1;
+        Some((v * 255 / max) as u8)
+    });
+    Some(Input::Background([parts.next()??, parts.next()??, parts.next()??]))
+}
+
 fn csi(params: &[u8], fin: u8) -> Option<Input> {
     if let [b'<', rest @ ..] = params {
         return pointer(rest, fin);
+    }
+    match (params, fin) {
+        ([b'?', ..], b'c') => return Some(Input::Answered),
+        ([], b'I') => return Some(Input::Focus(true)),
+        ([], b'O') => return Some(Input::Focus(false)),
+        _ => {}
     }
     if fin == b'u' {
         return kitty_key(params);
