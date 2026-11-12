@@ -124,8 +124,12 @@ pub(super) struct Grid {
 }
 
 impl Grid {
-    pub(super) fn new(w: u32, h: u32, bg: Rgb) -> Grid {
-        Grid { w: w as i32, h: h as i32, cells: vec![Cell::blank(bg); (w * h) as usize] }
+    /// A blank `w` × `h` grid in `bg`, in `old`'s cells when there is one.
+    pub(super) fn reuse(old: Option<Grid>, w: u32, h: u32, bg: Rgb) -> Grid {
+        let mut cells = old.map_or_else(Vec::new, |g| g.cells);
+        cells.clear();
+        cells.resize((w * h) as usize, Cell::blank(bg));
+        Grid { w: w as i32, h: h as i32, cells }
     }
 
     /// The cells of `[x0, y0, x1, y1]` (units, rounded to cells) inside `clip` and the screen.

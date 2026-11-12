@@ -58,6 +58,13 @@ pub(super) fn between(old: &[Instance], new_instances: &[Instance], size: (u32, 
     tiles(&damage, size)
 }
 
+/// `rects` as `between` gives them, from several frames, merged the same way: what those
+/// frames changed together.
+pub(super) fn merge(rects: &[Rect], size: (u32, u32)) -> Vec<Rect> {
+    let bounds: Vec<Bounds> = rects.iter().map(|r| [r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32]).collect();
+    tiles(&bounds, size)
+}
+
 /// A backdrop blur shows what's under it, so damage within its reach damages the blur.
 fn spread_backdrops(instances: &[Instance], damage: &mut Vec<Bounds>) {
     for inst in instances.iter().filter(|i| i.params[1] == KIND_BACKDROP_BLUR) {

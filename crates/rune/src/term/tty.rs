@@ -150,10 +150,16 @@ impl Tty {
     }
 
     pub(super) fn write(&self, bytes: &[u8]) {
-        let mut out = std::io::stdout().lock();
-        // A terminal that went away ends the run at the next read; nothing to report here.
-        let _ = out.write_all(bytes).and_then(|()| out.flush());
+        write(bytes);
     }
+}
+
+/// Writes `bytes` to the terminal in one piece, from any thread: what another thread writes
+/// goes before or after, never inside.
+pub(super) fn write(bytes: &[u8]) {
+    let mut out = std::io::stdout().lock();
+    // A terminal that went away ends the run at the next read; nothing to report here.
+    let _ = out.write_all(bytes).and_then(|()| out.flush());
 }
 
 impl Drop for Tty {

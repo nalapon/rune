@@ -30,10 +30,11 @@ use std::time::Duration;
 use self::grid::{Caret, Grid, Strings, Texels, rgb};
 use super::input::{self, Decode, Input};
 use super::tty::{Size, Tty};
+use super::{Clipboard, Pointer};
 use crate::app::App;
 use crate::color::Color;
 use crate::frame::clock::FrameClock;
-use crate::runtime::{Env, Runtime};
+use crate::runtime::{CellTexts, Env, Runtime};
 use crate::time::Instant;
 use crate::tooling::{Args, Length, runtime_for};
 use crate::{Family, TextStyle};
@@ -44,8 +45,8 @@ const FRAME_GAP: Duration = Duration::from_micros(16_667);
 const MOTION_BYTES: [f64; 2] = [8e6, 1e6];
 /// The biggest step, per sRGB channel (of 255), a cell's colours may lag while things move.
 const MOTION_TOLERANCE: u8 = 6;
-/// Rows one wheel notch scrolls.
-const WHEEL_ROWS: f32 = 3.0;
+/// Rows (or columns) one wheel notch scrolls.
+const WHEEL_CELLS: f32 = 3.0;
 /// How long the terminal gets to answer the start-up queries.
 const PROBE_WAIT: Duration = Duration::from_millis(200);
 /// Images whose sampled pixels are kept between frames.
@@ -66,8 +67,9 @@ fn dark_background(tty: &Tty, decode: &mut Decode, early: &mut Vec<Input>) -> Op
     let (start, mut buf, mut dark) = (Instant::now(), [0u8; 1024], None);
     while let Some(left) = PROBE_WAIT.checked_sub(start.elapsed()) {
         let n = tty.wait(Some(left), &mut buf);
+        let at = Instant::now();
         for &b in &buf[..n] {
-            for i in input::step(decode, b) {
+            for i in input::step(decode, b, at) {
                 match i {
                     Input::Background(c) => dark = Some(rgb_luminance(c) < 0.5),
                     Input::Answered => return dark,
@@ -116,8 +118,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
     tty.write(format!("\x1b]2;{}\x07", spec.title).as_bytes());
     let waker = tty.waker();
     shared.connect(waker.clone());
-    let mut clipboard = crate::clipboard::Client::default();
-    clipboard.connect(waker.clone());
+    let mut clipboard = Clipboard::new(waker.clone());
     let mut rt: Runtime<S> = runtime_for(&spec, state, (cols as f32, rows as f32), Env::new(dark, 1.0), waker);
     crate::text::set_cell_font(cell_font_size(&mut rt));
     rt.set_os_drag(false);
@@ -131,13 +132,13 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
 
     let mut clock = FrameClock::new(started);
     let mut buf = [0u8; 4096];
-    let mut shown: Option<Grid> = None;
-    let (mut strings, mut images) = (Strings::default(), Images::default());
-    let mut pointer = "default";
-    // The text the last mouse selection copied, so a click that keeps it copies nothing new.
-    let mut copied: Option<String> = None;
+    // What the terminal shows, and last frame's grid to draw the next one into.
+    let (mut shown, mut spare): (Option<Grid>, Option<Grid>) = (None, None);
+    let (mut strings, mut images, mut texts) = (Strings::default(), Images::default(), CellTexts::default());
+    let mut pointer = Pointer::default();
     let mut out = Vec::new();
-    let mut quit = early.into_iter().fold(false, |q, i| apply(&mut rt, i) || q);
+    // Ctrl-\ while the terminal answered the start-up queries.
+    if early.into_iter().fold(false, |q, i| apply(&mut rt, i) || q) { return Ok(()); }
     let (mut asked, mut busy, mut last_frame) = (true, false, started);
     // The caret the terminal shows.
     let mut shown_caret: Option<Caret> = None;
@@ -146,32 +147,28 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
     let budget = MOTION_BYTES[usize::from(std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some())];
     let (mut frames, mut bytes, mut cpu, mut drawing) = (0u64, 0u64, Duration::ZERO, Duration::ZERO);
 
-    while !quit {
+    loop {
         if quit_after.is_some_and(|d| started.elapsed() >= d) || crate::quit::quitting() { break; }
         let now = Instant::now();
         let mut timeout = if asked { Some(FRAME_GAP.saturating_sub(now - last_frame)) }
             else if busy { Some(gap.saturating_sub(now - last_frame)) }
             else { rt.wake_deadline().map(|d| Duration::from_secs_f64((d - (now - started).as_secs_f64()).max(0.0))) };
         if let Some(d) = quit_after { timeout = Some(timeout.map_or(d, |t| t.min(d.saturating_sub(started.elapsed())))); }
+        if let Some(d) = decode.deadline() { let left = d.saturating_duration_since(now); timeout = Some(timeout.map_or(left, |t| t.min(left))); }
         let n = tty.wait(timeout, &mut buf);
         let mut released = false;
-        for &b in &buf[..n] {
-            for i in input::step(&mut decode, b) {
-                released |= matches!(i, Input::Up(..));
-                quit |= apply(&mut rt, i);
-            }
-        }
-        if n > 0 { for i in input::idle(&mut decode) { quit |= apply(&mut rt, i); } }
-        if quit { break; }
-        if released && rt.copy_request.is_none() {
-            let text = rt.selected_text();
-            if text.is_some() && text != copied { rt.copy_request = Some(crate::ClipboardWrite::new(text.clone().unwrap_or_default().into())); }
-            copied = text;
-        }
-        asked |= n > 0 || clipboard.receive(&mut rt);
+        let fed = input::feed(&mut decode, &buf[..n], Instant::now(), |i| {
+            released |= matches!(i, Input::Up(..));
+            apply(&mut rt, i)
+        });
+        if fed.quit { break; }
+        if released { clipboard.released(&mut rt); }
+        asked |= fed.acted || fed.moved;
         let updates = shared.take().updates;
         asked |= !updates.is_empty();
         for f in updates { rt.update_if(f); }
+        asked |= clipboard.step(&mut rt, &tty);
+        pointer.show(&rt, &tty);
         if let Some((c, r)) = Size::grid() && (c, r) != (cols, rows) {
             (cols, rows) = (c, r);
             rt.set_viewport((cols as f32, rows as f32), 1.0);
@@ -187,15 +184,6 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
         asked = false;
         last_frame = now;
 
-        out.clear();
-        // A copy reaches the terminal's clipboard as well as the system's, so it works over
-        // SSH. A secret stays out: the terminal has no way to clear it after.
-        if let Some(copy) = &rt.copy_request && !copy.is_secret() {
-            out.extend_from_slice(b"\x1b]52;c;");
-            super::kitty::base64(copy.content().text().as_bytes(), &mut out);
-            out.push(0x07);
-        }
-        clipboard.flush(&mut rt);
         if rt.popup_menu().is_some() { rt.cancel_popups(); }
         rt.refuse_file_dialog("native file dialogs are unsupported in a terminal");
         let (moving, _) = clock.advance(&mut rt, now, false);
@@ -204,29 +192,27 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
         let drawn = Instant::now();
         if strings.full() { (strings, shown) = (Strings::default(), None); }
         let [r, g, b, _] = rt.clear_color();
-        let mut grid = Grid::new(cols, rows, rgb(Color { r, g, b, a: 1.0 }));
-        for p in rt.cell_paints() {
+        let mut grid = Grid::reuse(spare.take(), cols, rows, rgb(Color { r, g, b, a: 1.0 }));
+        rt.cell_paints(&mut texts, |p| {
             let texels = p.image.as_ref().and_then(|img| images.get(img));
-            grid.draw(&p, &mut strings, texels);
-        }
-        let caret: Option<Caret> = rt.cell_caret().map(|([x, y], c)| ((x.round() as i32, y.round() as i32), rgb(c)))
+            grid.draw(p, &mut strings, texels);
+        });
+        let caret: Option<Caret> = rt.cell_caret(&mut texts).map(|([x, y], c)| ((x.round() as i32, y.round() as i32), rgb(c)))
             .filter(|&((x, y), _)| x >= 0 && y >= 0 && x < grid.w && y < grid.h);
         let tolerance = if moving { MOTION_TOLERANCE } else { 0 };
-        let start = out.len();
+        out.clear();
         let wrote = grid::encode(shown.as_ref(), &mut grid, &strings, caret, tolerance, &mut out);
         // Nothing new on screen: send nothing rather than an empty update.
-        if !wrote && shown.is_some() && caret == shown_caret { out.truncate(start); }
+        if !wrote && shown.is_some() && caret == shown_caret { out.clear(); }
         shown_caret = caret;
-        let shape = super::cursor_name(&rt.cursor());
-        if shape != pointer {
-            pointer = shape;
-            out.extend_from_slice(format!("\x1b]22;{shape}\x1b\\").as_bytes());
-        }
         if !out.is_empty() { tty.write(&out); }
-        shown = Some(grid);
+        spare = shown.replace(grid);
+        texts.sweep();
         clock.presented(&mut rt, Instant::now());
         (frames, bytes, cpu, drawing) = (frames + 1, bytes + out.len() as u64, cpu + now.elapsed(), drawing + drawn.elapsed());
         if let Some(mut ready) = on_ready.take() { ready(&crate::WindowHandle::new("main")); }
+        asked |= clipboard.step(&mut rt, &tty);
+        pointer.show(&rt, &tty);
         let input = rt.has_pending_input() || rt.live_pending();
         busy = moving || input;
         gap = if input { FRAME_GAP } else { FRAME_GAP.max(Duration::from_secs_f64(out.len() as f64 / budget)) };
@@ -251,8 +237,8 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input) -> bool {
         Input::Down(x, y) => { rt.pointer_move(p(x), p(y)); rt.pointer_down(p(x), p(y)) }
         Input::Up(x, y) => rt.pointer_up(p(x), p(y)),
         // As a window's wheel: `on_wheel` handlers hear it before a scroll view moves. A notch
-        // down moves the content up (negative `dy`).
-        Input::Wheel(x, y, notches) => rt.wheel_event(crate::WheelEvent::new(0.0, -notches * WHEEL_ROWS).at(p(x), p(y))),
+        // down moves the content up (negative `dy`), one right moves it left.
+        Input::Wheel(x, y, right, down) => rt.wheel_event(crate::WheelEvent::new(-right * WHEEL_CELLS, -down * WHEEL_CELLS).at(p(x), p(y))),
         Input::Paste(text) => rt.paste(text),
         Input::Focus(focused) => rt.window_focus(focused),
         Input::Background(_) | Input::Answered => {}

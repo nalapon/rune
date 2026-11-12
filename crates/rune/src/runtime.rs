@@ -132,7 +132,7 @@ mod scroll_bottom;
 mod caret;
 #[path = "runtime/cells.rs"]
 mod cells;
-pub(crate) use cells::{CellBorder, CellGlyph, CellImage, CellLine, CellPaint, CellText};
+pub(crate) use cells::{CellBorder, CellGlyph, CellImage, CellLine, CellPaint, CellText, CellTexts};
 #[path = "runtime/event_log.rs"]
 pub(crate) mod event_log;
 #[path = "runtime/layout_read.rs"]
