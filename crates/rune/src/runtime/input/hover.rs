@@ -235,9 +235,11 @@ impl<S: 'static> Runtime<S> {
     /// while hover follows it.
     fn layout_moving(&self) -> bool {
         let layout = [prop::FRAME.id, prop::OFFSET.id, prop::TRAVEL.id];
+        // A culled virtual row keeps its growth state while out of sight, where nothing steps it.
+        let mounted = |id: &NodeId| self.node_index.contains_key(id);
         !self.flying.is_empty()
-            || self.stacks.values().any(|s| s.moving)
-            || self.grows.values().any(|g| g.moving())
+            || self.stacks.iter().any(|(id, s)| s.moving && mounted(id))
+            || self.grows.iter().any(|(id, g)| g.moving() && mounted(id))
             || self.scrolls.values().any(|s| scroll_carries(s, self.clock))
             || self.scene.store().active().any(|(_, p)| layout.contains(&p))
     }

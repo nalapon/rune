@@ -122,3 +122,41 @@ fn an_edit_shares_most_of_its_text_and_a_replacement_does_not() {
     assert!(!edited("Show", "Hide"));
     assert!(!edited("The first note", "Another one"));
 }
+
+fn field_beside_label(edit: &crate::TextEdit, _: &mut Cx<crate::TextEdit>) -> El {
+    let style = crate::TextStyle::new(15.0, 400.0);
+    col().w_full()
+        .child(crate::el::text(edit.text.to_string()).font(style).w_full().wrap().key("label"))
+        .child(crate::text_input(edit, style).w_full().dir(crate::Direction::Rtl).dir_by_paragraph().key("field"))
+}
+
+fn is_rtl(rt: &Runtime<crate::TextEdit>, key: &str) -> bool {
+    rt.nodes.iter().find(|n| n.key.as_deref() == Some(key)).and_then(|n| n.text_layout.as_ref()?.single()).unwrap().is_rtl()
+}
+
+/// A right-to-left by-paragraph field whose one line has no strong character reads right to
+/// left, though a label above it shows the same text in the same style left to right.
+#[test]
+fn a_right_to_left_field_keeps_its_direction_beside_a_label_of_the_same_text() {
+    let mut rt = Runtime::new(crate::TextEdit::new("123"), field_beside_label, (400.0, 300.0), Env::new(true, 2.0));
+    rt.frame(0.0);
+    assert!(!is_rtl(&rt, "label"));
+    assert!(is_rtl(&rt, "field"), "the field doesn't take the label's layout");
+}
+
+fn by_paragraph(edit: &crate::TextEdit, _: &mut Cx<crate::TextEdit>) -> El {
+    col().w_full().child(crate::text_input(edit, crate::TextStyle::new(15.0, 400.0)).w_full().dir_by_paragraph().key("field"))
+}
+
+/// A new language shapes every line of a by-paragraph field again: none keeps the layout its
+/// last text shaped in the old one.
+#[test]
+fn a_new_language_shapes_every_line_of_a_by_paragraph_field_again() {
+    let mut rt = Runtime::new(crate::TextEdit::new("one\ntwo\nthree"), by_paragraph, (400.0, 300.0), Env::new(true, 2.0));
+    rt.frame(0.0);
+    let shaped = rt.text.shaped;
+    assert!(rt.text.set_language(parley::fontique::Language::parse("de").ok()));
+    rt.invalidate();
+    rt.frame(1.0 / 120.0);
+    assert!(rt.text.shaped >= shaped + 3, "{} of 3 lines shaped again", rt.text.shaped - shaped);
+}

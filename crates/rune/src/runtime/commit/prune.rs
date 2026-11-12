@@ -18,14 +18,7 @@ impl<S: 'static> Runtime<S> {
         self.node_index.clear();
         for (old_idx, mut n) in old.drain(..).enumerate() {
             if !self.scene.contains(n.id) {
-                self.hover_pruned(&n);
-                self.reveals.remove(&n.id);
-                self.scrolls.remove(&n.id);
-                self.loops.remove(&n.id);
-                if !self.node_caches.is_empty() {
-                    self.node_caches.remove(&n.id);
-                    self.text.atlas.resident_caches.remove(&n.id.0);
-                }
+                self.forget_gone(&n);
                 continue;
             }
             n.parent = n.parent.and_then(|p| remap[p]);
@@ -51,6 +44,23 @@ impl<S: 'static> Runtime<S> {
             let keep = self.live.dirty();
             self.subscribe_live();
             self.live.pruned(keep);
+        }
+    }
+
+    /// Forgets what a node whose exit finished kept: its hover, reveal, scroll, loop and
+    /// raster, and a growth stack with its rows' heights, so the same path comes back new. One
+    /// unmounted at once (and what it held) keeps them, to come back as it was.
+    fn forget_gone(&mut self, n: &Node) {
+        self.hover_pruned(n);
+        self.reveals.remove(&n.id);
+        self.scrolls.remove(&n.id);
+        self.loops.remove(&n.id);
+        if !self.node_caches.is_empty() {
+            self.node_caches.remove(&n.id);
+            self.text.atlas.resident_caches.remove(&n.id.0);
+        }
+        if let Some(stack) = self.stacks.remove(&n.id) {
+            for id in &stack.order { self.grows.remove(id); }
         }
     }
 }

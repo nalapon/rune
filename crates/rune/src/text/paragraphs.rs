@@ -491,16 +491,21 @@ impl TextSystem {
         if !spec.by_paragraph(input) {
             return TextLayout::Single(self.layout_for_spec(spec, scale, max_width, align));
         }
+        // A language chosen since drops what was shaped in the last one, before the cache or
+        // the last layout's paragraphs are looked at.
+        self.follow_language();
         // One paragraph and no pills, as most drafts are: one layout in its own direction.
         if spec.cold.pills.is_empty() && !spec.content.contains('\n') {
             let base = flow_of(&spec.content, &[]).unwrap_or(spec.plaintext_flow()).base();
-            let shape = spec.shape_key(scale).map(|k| hash::directed(k, base));
+            // The shape key is already in this direction (`TextSpec::base` reads it the same
+            // way); turning it again would cancel it, and an `Auto` text would share the layout.
+            debug_assert_eq!(base, spec.base());
             let style = (&spec.content, &spec.spans, &spec.cold.blocks);
-            return TextLayout::Single(self.layout_keyed(shape, style.0, style.1, style.2, &[], spec.style, scale, max_width, align, spec.wrap_anywhere, Keep::Cached, base));
+            return TextLayout::Single(self.layout_keyed(spec.shape_key(scale), style.0, style.1, style.2, &[], spec.style, scale, max_width, align, spec.wrap_anywhere, Keep::Cached, base));
         }
-        let whole = spec.shape_key(scale).unwrap_or_else(|| spec.fresh_shape_key(scale));
+        let shape = spec.shape_key(scale).unwrap_or_else(|| spec.fresh_shape_key(scale));
         // Lines with no strong character take the element's flow, so it keys the whole too.
-        let whole = if spec.plaintext_flow() == Flow::Rtl { whole ^ 0x3c6e_f372_fe94_f82b } else { whole };
+        let whole = if spec.plaintext_flow() == Flow::Rtl { shape ^ 0x3c6e_f372_fe94_f82b } else { shape };
         let blocks = &spec.cold.blocks;
         let indented = blocks.iter().any(|&b| b != Block::Paragraph).then_some(blocks.as_slice());
         let key = hash::break_key(whole ^ PARAGRAPHS, max_width, align, indented);
@@ -526,7 +531,8 @@ impl TextSystem {
         let built = Rc::new(built);
         self.last_paragraphs = Some(built.clone());
         // It holds what it shaped or broke anew; the paragraphs it kept are its last layout's.
-        self.paragraphs.insert(key, Entry::new(built.clone(), g, fresh + built.paragraphs.len() * size_of::<Paragraph>() / 64, whole));
+        // It records the text's own shape key, which an edit of the text supersedes.
+        self.paragraphs.insert(key, Entry::new(built.clone(), g, fresh + built.paragraphs.len() * size_of::<Paragraph>() / 64, shape));
         TextLayout::Paragraphs(built)
     }
 
@@ -537,7 +543,7 @@ impl TextSystem {
         let (content, style) = (spec.content.as_str(), spec.style);
         let style_key = {
             let mut h = hash::KeyHasher::default();
-            (hash::text_hash("", &[], style, scale, None), spec.wrap_anywhere).hash(&mut h);
+            (hash::text_hash("", &[], style, scale, None), spec.wrap_anywhere, self.shaped_epoch).hash(&mut h);
             h.finish()
         };
         let mut found: Vec<(usize, usize, Flow, u64, Box<[(u32, u32)]>)> = Vec::new();

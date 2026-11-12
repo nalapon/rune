@@ -78,6 +78,9 @@ impl TextSystem {
         self.shapes.clear();
         self.superseded.clear();
         self.elisions.clear();
+        self.paragraphs.clear();
+        self.last_paragraphs = None;
+        self.shaped_epoch += 1;
         self.runs.clear();
         self.primary_traks.clear();
         self.primary_axes.clear();

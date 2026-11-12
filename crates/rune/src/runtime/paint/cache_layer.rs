@@ -147,23 +147,8 @@ impl<S: 'static> Runtime<S> {
                 self.window_focused.hash(&mut h);
             }
             mark_ranges.hash(&mut h);
-            let mut scroll_mix = 0u64;
-            for (&id, st) in &self.scrolls {
-                let mut sh = rune_motion::Fx::default();
-                sh.write_u64(id.0);
-                sh.write_u64(st.offset.to_bits());
-                sh.write_u64(st.x.offset.to_bits());
-                sh.write_u32(st.held as u32);
-                sh.write_u32(st.slack.height().to_bits());
-                scroll_mix = scroll_mix.wrapping_add(sh.finish());
-            }
-            for (path, &off) in &self.input_scroll {
-                let mut sh = rune_motion::Fx::default();
-                path.hash(&mut sh);
-                sh.write_u32(off.to_bits());
-                scroll_mix = scroll_mix.wrapping_add(sh.finish());
-            }
-            h.write_u64(scroll_mix);
+            // Scroll offsets go in per cached subtree below: those inside it and around it. A
+            // scroll view elsewhere in the window changes nothing a cached subtree draws.
             paint_state_hash = h.finish();
 
             self.cache_live_scratch.resize(n_nodes, false);
@@ -214,6 +199,37 @@ impl<S: 'static> Runtime<S> {
                     }
                     if links { self.link_states(i).hash(&mut ph); }
                     self.cache_paint_scratch[i] = self.cache_paint_scratch[i].wrapping_add(ph.finish());
+                }
+                // A scroll inside the subtree moves what the raster holds. One around it moves
+                // the raster, and a move to another device-pixel phase re-snaps the resting
+                // shapes and icons inside it to the grid, so a cached root counts its ancestors'.
+                let scroll_hash = |id: NodeId, st: &ScrollState| {
+                    let mut sh = rune_motion::Fx::default();
+                    sh.write_u64(id.0);
+                    sh.write_u64(st.offset.to_bits());
+                    sh.write_u64(st.x.offset.to_bits());
+                    sh.write_u32(st.held as u32);
+                    sh.write_u32(st.slack.height().to_bits());
+                    sh.finish()
+                };
+                if let Some(st) = self.scrolls.get(&n.id) {
+                    self.cache_paint_scratch[i] = self.cache_paint_scratch[i].wrapping_add(scroll_hash(n.id, st));
+                }
+                if n.vis_flags.cache() {
+                    let mut up = n.parent;
+                    while let Some(k) = up {
+                        let id = self.nodes[k].id;
+                        if let Some(st) = self.scrolls.get(&id) {
+                            self.cache_paint_scratch[i] = self.cache_paint_scratch[i].wrapping_add(scroll_hash(id, st));
+                        }
+                        up = self.nodes[k].parent;
+                    }
+                }
+                if n.input.is_some() && let Some(&off) = self.input_scroll.get(&n.path) {
+                    let mut sh = rune_motion::Fx::default();
+                    n.path.hash(&mut sh);
+                    sh.write_u32(off.to_bits());
+                    self.cache_paint_scratch[i] = self.cache_paint_scratch[i].wrapping_add(sh.finish());
                 }
                 if let Some(p) = n.parent {
                     self.cache_paint_scratch[p] = self.cache_paint_scratch[p].wrapping_add(self.cache_paint_scratch[i]);

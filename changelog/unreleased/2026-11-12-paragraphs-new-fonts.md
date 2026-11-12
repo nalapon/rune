@@ -1,0 +1,1 @@
+- **Text fields: new fonts or a new language shape a by-paragraph field again.** Changing the families, the language or the web faces dropped every shaped layout but a by-paragraph field's: it kept each line from its last layout, still in the old fonts, until the line was edited. Those layouts go with the rest now, and a field's next layout keeps no line shaped before the change.

@@ -60,3 +60,24 @@ fn pruning_left_rows_reuses_the_node_buffers() {
     }
     assert!(buffers.len() <= 2, "{} node buffers in 8 rounds", buffers.len());
 }
+
+/// A growth stack whose exit finished keeps nothing of its rows: when it comes back at the same
+/// path it mounts settled, as a new stack does, rather than growing in the rows it lacks.
+#[test]
+fn a_growth_stack_that_left_comes_back_settled() {
+    fn view(s: &(bool, usize), _: &mut Cx<(bool, usize)>) -> El {
+        let stack = col().key("stack").w_full().growth(GrowthSpec::default())
+            .children((0..s.1).map(|i| el().key(format!("r{i}")).w_full().h(20.0)));
+        col().key("root").size(200.0, 200.0).children(s.0.then_some(stack))
+    }
+    let mut rt = Runtime::new((true, 2), view, (200.0, 200.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    rt.update(|s, _| s.1 = 4);
+    rt.frame(1.0 / 60.0);
+    rt.update(|s, _| s.0 = false);
+    for _ in 0..120 { rt.frame(1.0 / 60.0); }
+    assert!(rt.presented("stack").is_none(), "the stack's exit finished");
+    rt.update(|s, _| *s = (true, 6));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.presented("r5").unwrap().0, [0.0, 100.0, 200.0, 20.0], "the last row shows where it rests");
+}

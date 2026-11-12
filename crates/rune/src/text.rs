@@ -198,6 +198,9 @@ pub struct TextSystem {
     paragraphs: Cache<Rc<ParagraphLayout>>,
     /// The last by-paragraph layout made this commit, which its text at another width breaks from.
     last_paragraphs: Option<Rc<ParagraphLayout>>,
+    /// How many times `drop_shaped` ran. Paragraph keys take it, so a field's next layout
+    /// doesn't keep paragraphs its last one shaped in other fonts or another language.
+    shaped_epoch: u64,
     runs: Cache<Rc<RunLayout>>,
     generation: u32,
     /// The slots' families as named; `sans` and `mono` are the lists text asks for.
@@ -333,6 +336,7 @@ impl TextSystem {
             elisions: Default::default(),
             paragraphs: Default::default(),
             last_paragraphs: None,
+            shaped_epoch: 0,
             runs: Default::default(),
             generation: 0,
             families: (families.0.to_owned(), families.1.to_owned()),
