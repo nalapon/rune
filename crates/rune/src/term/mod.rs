@@ -1,5 +1,7 @@
 //! `--term`: run the app inside a terminal that speaks the Kitty graphics protocol (Kitty,
 //! Ghostty), as one image filling the window, with the terminal's mouse and keys as input.
+//! `--term` alone asks the terminal first and draws on its character grid (`cells`) when it
+//! has no Kitty graphics.
 //!
 //! Each frame renders offscreen as a window's would. `damage` finds what changed from the
 //! instances drawn, `readback` copies only those rectangles off the GPU while the next frame
@@ -128,6 +130,12 @@ impl Target {
         let view = texture.create_view(&Default::default());
         Target { texture, view }
     }
+}
+
+/// Whether `--term` without a transport draws pixels: the terminal reports its pixel size and
+/// answers a Kitty graphics query. Otherwise it draws on the character grid (`--term cells`).
+pub(crate) fn shows_pixels() -> bool {
+    Size::now().is_some() && tty::kitty_graphics()
 }
 
 pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport) -> Result<(), String> {

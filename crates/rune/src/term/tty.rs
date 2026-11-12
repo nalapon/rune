@@ -6,7 +6,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::runtime::Waker;
 
@@ -55,6 +55,37 @@ const ENTER_CELLS: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?100
 /// (OSC 22) back and any hyperlink closed. No image commands: a terminal without Kitty
 /// graphics would print them.
 const LEAVE_CELLS: &[u8] = b"\x1b]8;;\x1b\\\x1b[0m\x1b[0 q\x1b]112\x07\x1b]22;default\x1b\\\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l";
+
+/// Asks the terminal whether it shows Kitty graphics: a query about a one-pixel image, then a
+/// device-attributes request (DA1) that every terminal answers. A terminal with the protocol
+/// answers the query before the request; one without answers only the request, and tmux
+/// answers for itself. No answer within half a second (a slow link, no terminal) counts as no.
+pub(super) fn kitty_graphics() -> bool {
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 { return false; }
+    let mut raw = saved;
+    unsafe { libc::cfmakeraw(&mut raw) };
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 { return false; }
+    {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c").and_then(|()| out.flush());
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut got = Vec::new();
+    // The DA1 answer, `ESC [ ? … c`, ends what the terminal sends.
+    let answered = |got: &[u8]| got.windows(3).position(|w| w == b"\x1b[?").is_some_and(|at| got[at..].contains(&b'c'));
+    while !answered(&got) {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+        let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        if left == 0 || unsafe { libc::poll(&mut fd, 1, left) } <= 0 { break; }
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 { break; }
+        got.extend_from_slice(&buf[..n as usize]);
+    }
+    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
+    got.windows(9).any(|w| w == b"_Gi=31;OK")
+}
 
 /// The wake pipe's write end, for the SIGWINCH handler.
 static RESIZED: AtomicI32 = AtomicI32::new(-1);

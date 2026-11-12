@@ -74,8 +74,9 @@ pub struct Args {
     /// runs after its first frame.
     pub(crate) realtime: bool,
     /// `--term [zlib|base64|shm|cells]`: run inside a terminal with the Kitty graphics protocol,
-    /// sending pixels this way (`term::Transport`; empty picks one, `Transport::auto`), or on
-    /// its character grid (`cells`, any terminal).
+    /// sending pixels this way (`term::Transport`), or on its character grid (`cells`, any
+    /// terminal). Empty asks the terminal (`term::shows_pixels`): pixels sent as
+    /// `Transport::auto` picks when it has Kitty graphics, else its character grid.
     pub(crate) term: Option<String>,
     /// `--term-stats`: print where `--term`'s frames spent their time on exit.
     pub(crate) term_stats: bool,

@@ -610,7 +610,7 @@ impl<S: 'static> App<S> {
         };
         if let Some(how) = args.term.clone() {
             #[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
-            return if how == "cells" { crate::term::run_cells(self, args) }
+            return if how == "cells" || how.is_empty() && !crate::term::shows_pixels() { crate::term::run_cells(self, args) }
                 else { crate::term::run(self, args, crate::term::Transport::parse(&how).unwrap_or_else(crate::term::Transport::auto)) };
             #[cfg(not(all(unix, not(any(target_os = "ios", target_os = "android")))))]
             return Err(format!("--term {how}: needs a Unix terminal"));
