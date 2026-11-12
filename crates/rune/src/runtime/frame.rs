@@ -87,6 +87,7 @@ impl<S: 'static> Runtime<S> {
                 self.queue.push(Action::WindowFocus(focused));
             }
             if !focused {
+                self.finish_composition();
                 self.keys_lost();
                 // Losing the window ends hover, rather than waiting out an exit grace. A window
                 // that isn't key still hears the pointer, so its next move starts the wait again.
@@ -276,7 +277,7 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn transaction(&self) -> Tx {
         Tx { trace: self.tracing().then(crate::el::TraceCalls::default), mods: self.held_mods, selection: self.selection_snapshot(),
-            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), focused: self.focused_key(), ..Tx::default() }
+            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), focused: self.focused_key(), assistive: self.a11y.is_some(), ..Tx::default() }
     }
 
     /// A scalar from the actual draw path (e.g. `shell.width`). Values hold until resampled.
@@ -462,9 +463,10 @@ impl<S: 'static> Runtime<S> {
         self.wake_deadlines.drain(..due);
         self.fire_hover_delays();
         self.fire_press_repeat();
-        let (wake, redraw) = crate::spell::pause::tick(&mut self.spell_watch, self.clock);
+        // Marks are paint's (`paint::content`), and this frame paints: a pause that ends or words
+        // the checker brought back show without the view running again.
+        let (wake, _marked) = crate::spell::pause::tick(&mut self.spell_watch, self.clock);
         if let Some(at) = wake { self.schedule_wakes([std::time::Duration::from_secs_f64((at - self.clock).max(0.0))]); }
-        if redraw { self.dirty = true; }
         if let Some(poll) = self.poll.filter(|_| !polled) {
             let mut one = self.transaction();
             // Scheduling does not imply a model change.
@@ -507,7 +509,7 @@ impl<S: 'static> Runtime<S> {
             // the previous field. The same boundary covers an earlier handler, and lets a
             // file drag find only what is mounted and reachable now (a covered window builds
             // nothing until this).
-            let routed = matches!(&action, Action::Key { .. } | Action::KeyUp(_) | Action::Physical(..) | Action::Ime(_) | Action::Paste(..) | Action::Files(_));
+            let routed = matches!(&action, Action::Key { .. } | Action::KeyUp(_) | Action::Physical(..) | Action::Ime(_) | Action::FinishIme | Action::Paste(..) | Action::Files(_));
             // So is a playground an earlier handler opened or moved.
             if routed { self.latch_playground(&mut tx); }
             if (ran || self.dirty || !tx.scroll_to.is_empty()) && routed {
@@ -518,6 +520,7 @@ impl<S: 'static> Runtime<S> {
                     #[cfg(debug_assertions)]
                     if ran_other || self.dirty || ran_layout { self.live_check = None; }
                     self.capture_keeps(&mut tx);
+                    tx.unprompted = self.motion_needs_cause && why & CommitWhy::INPUT == 0 && !tx.asked_motion;
                     self.commit_for(&tx, std::mem::take(&mut why) | CommitWhy::ROUTE | if self.dirty { CommitWhy::DIRTY } else { 0 });
                     #[cfg(debug_assertions)]
                     { let check = self.live_check.take(); self.compare_live_check(check); ran_other = false; }
@@ -598,6 +601,9 @@ impl<S: 'static> Runtime<S> {
             if ran_other || besides || ran_layout || read_moved { self.live_check = None; }
             self.capture_keeps(&mut tx);
             let flag = |on: bool, bit: u16| if on { bit } else { 0 };
+            // Motion has a cause: the user, in this window. A commit nothing in this frame's
+            // input asked for shows what it brings in its final state (`Tx::unprompted`).
+            tx.unprompted = self.motion_needs_cause && why & CommitWhy::INPUT == 0 && !tx.asked_motion;
             self.commit_for(&tx, why | flag(self.dirty, CommitWhy::DIRTY) | flag(self.relayout, CommitWhy::RELAYOUT) | flag(self.settle, CommitWhy::SETTLE)
                 | flag(shifted, CommitWhy::VIRTUAL) | flag(ran_layout, CommitWhy::LAYOUT) | flag(read_moved, CommitWhy::READ));
             #[cfg(debug_assertions)]

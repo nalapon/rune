@@ -29,6 +29,14 @@ pub(crate) fn safe_area() -> [f32; 4] { INSETS.get() }
 /// The largest viewport's height in CSS points, or 0 before the browser has reported one.
 pub(crate) fn large_viewport() -> f32 { LARGE_VIEWPORT.get() }
 
+/// Fetches the font at `url` now, for something about to draw in it (a terminal's face, say),
+/// as `App::font_url_later` fetches its fonts after the first frame: every window takes it up
+/// on its next frame once it arrives; until then text in its family sets in the slot's fallback.
+/// Asked before the first frame, it waits for it. Each URL loads once.
+pub fn font_url_now(url: &str) {
+    full_faces::now(url);
+}
+
 /// Open an HTTP(S) or mail link in a new browser tab. Call from a user input handler;
 /// browser popup policy applies. The new page receives no opener or referrer.
 pub fn open_url(url: &str) -> Result<(), String> {
@@ -505,7 +513,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
             let mut renderer = Renderer::new(&gpu.device, format);
             renderer.set_srgb_blend(!format.is_srgb());
             renderer.attach_text(&mut rt.text.atlas);
-            let cursor = crate::cursor::os::OsCursor::new(event_loop);
+            let cursor = crate::cursor::os::OsCursor::new();
             let input = input::Bridge::new(&window.canvas().unwrap(), Rc::downgrade(&self.running), window.clone(),
                 input::Mode { embedded: self.embedded, fit_height, document });
             *self.running.borrow_mut() = Some(Running { gpu, surface, config, renderer, rt, shared, input, clipboard,

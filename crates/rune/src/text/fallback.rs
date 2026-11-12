@@ -12,7 +12,7 @@ pub(super) enum Route {
     /// Mathematical Alphanumeric Symbols: one math font for a whole formula, so bold, italic
     /// and script letters don't mix designs when an earlier fallback covers a few of them.
     Math,
-    /// A grapheme asking for emoji presentation with `U+FE0F` (`❤️`, `☀️`, `✔️`): the colour
+    /// A grapheme that draws as an emoji (`is_emoji`: `U+FE0F`, or emoji by default) (`❤️`, `☀️`, `✔️`): the colour
     /// emoji font first, so a text font with a plain `❤` doesn't take it.
     Emoji,
 }
@@ -56,8 +56,9 @@ pub(super) const MONO_SCRIPT_FAMILIES: &[&str] = &["DejaVu Sans Mono"];
 pub(super) struct ScriptFonts {
     pub script: &'static [u8; 4],
     pub blocks: &'static [(u32, u32)],
-    /// Windows asks DirectWrite instead (`system_fonts::direct_write`).
-    #[cfg_attr(all(windows, not(test)), allow(dead_code))]
+    /// The script's usual font files: what the tests check for what's installed. The app asks
+    /// the platform's own fallback (`system_fonts::platform`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub files: &'static [&'static str],
 }
 
@@ -114,6 +115,23 @@ pub(super) fn is_math_alphanumeric(ch: char) -> bool {
         | 0x212F..=0x2131 | 0x2133..=0x2134 | 0x2145..=0x2149)
 }
 
+/// Whether `ch` is an emoji or other pictograph (`Extended_Pictographic`), as ZWJ sequences
+/// join.
+pub(crate) fn is_pictographic(ch: char) -> bool {
+    use icu_properties::{CodePointSetData, props::ExtendedPictographic};
+    CodePointSetData::new::<ExtendedPictographic>().contains(ch)
+}
+
+/// Whether grapheme `g` draws as an emoji: `U+FE0F`, a character emoji by default
+/// (`Emoji_Presentation`: ✅ ⚡ 🔥, not ☺ ✓ ©), a skin tone, a keycap, a flag or a tag
+/// sequence, unless `U+FE0E` asks for text.
+pub(super) fn is_emoji(g: &str) -> bool {
+    use icu_properties::{CodePointSetData, props::EmojiPresentation};
+    if g.contains('\u{FE0E}') { return false; }
+    g.chars().any(|c| matches!(c as u32, 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF | 0xE0020..=0xE007F))
+        || g.chars().next().is_some_and(|c| CodePointSetData::new::<EmojiPresentation>().contains(c))
+}
+
 /// Routed byte ranges of `text`, merging neighbours on the same route.
 pub(super) fn routes(text: &str) -> Vec<(Range<usize>, Route)> {
     let mut out = Vec::new();
@@ -126,7 +144,7 @@ pub(super) fn routes(text: &str) -> Vec<(Range<usize>, Route)> {
     };
     // Whole graphemes, so a ZWJ sequence with an `FE0F` inside keeps one font.
     for (i, g) in text.grapheme_indices(true) {
-        if g.contains('\u{FE0F}') {
+        if is_emoji(g) {
             push(i..i + g.len(), Route::Emoji);
             continue;
         }

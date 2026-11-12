@@ -37,6 +37,9 @@ mod continuous_corner_tests;
 #[cfg(test)]
 #[path = "layer_show_tests.rs"]
 mod show_tests;
+#[cfg(test)]
+#[path = "layer_rebind_tests.rs"]
+mod rebind_tests;
 
 pub(super) struct Layers {
     plan: Vec<Layer>,
@@ -54,11 +57,18 @@ pub(super) struct Layers {
     viewport: (u32, u32),
     image_generation: u64,
     allocations: u64,
+    /// The atlas and outline texture generation: every target's base bind group names the
+    /// generation it was made against, and a parked target is bound again only when a layer takes
+    /// it in a later one.
+    bindings: u64,
     cache_budget: u64,
     frame_stamp: u64,
     /// Test-only: the most bytes of live targets and their blur scratches a frame has held at once.
     #[cfg(test)]
     peak: u64,
+    /// Test-only: how many times a target's base bind group has been made again.
+    #[cfg(test)]
+    pub(super) binds: u64,
 }
 
 impl Layers {
@@ -119,10 +129,13 @@ impl Default for Layers {
             viewport: (0, 0),
             image_generation: 0,
             allocations: 0,
+            bindings: 0,
             cache_budget: DEFAULT_CACHE_BUDGET,
             frame_stamp: 0,
             #[cfg(test)]
             peak: 0,
+            #[cfg(test)]
+            binds: 0,
         }
     }
 }
@@ -156,6 +169,11 @@ pub(super) struct Target {
     cache: Option<(u64, u64)>,
     last_used: u64,
     content_size: [f32; 2],
+    /// The `Layers::bindings` generation the base bind group was made against.
+    binding: u64,
+    /// Test-only: the outline texture's height the base bind group was made against.
+    #[cfg(test)]
+    outline_rows: u32,
 }
 
 impl Describe for Target {
@@ -169,6 +187,19 @@ impl Describe for Target {
             content: self.content_size,
         }
     }
+}
+
+/// Binds `t` to the frame's atlas and outline texture, and to `generation`: its base bind group
+/// here, its composite and image and glyph pages at the next `prepare_layers`.
+fn rebind_target(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer,
+    outlines: Option<&wgpu::Texture>, atlas: &wgpu::Texture, t: &mut Target, generation: u64) {
+    t.base = Renderer::bind_group(device, layout, globals, outlines, atlas, atlas, Some(&t.projection));
+    // No target's identity is 0, so the composite is made again.
+    t.composite_parent = Some(0);
+    t.image_generation = u64::MAX;
+    t.binding = generation;
+    #[cfg(test)]
+    { t.outline_rows = outlines.map_or(0, wgpu::Texture::height); }
 }
 
 /// Resource/pass counters for diagnostics. The ordinary path creates no layer resources.
@@ -435,10 +466,13 @@ impl Renderer {
                     if let Some(mut t) = self.layers.targets[slot].take() { t.cache = None; self.layers.spare.push(t); }
                 }
                 Move::Set { slot, from } => {
-                    let t = match from {
+                    let mut t = match from {
                         Kept::Retained(at) => self.layers.retained.swap_remove(at),
                         Kept::Spare(at) => self.layers.spare.swap_remove(at),
                     };
+                    // A target parked before the atlas or outline texture changed binds it now,
+                    // once; a spare no layer takes again never makes a bind group at all.
+                    self.rebind_if_stale(device, &mut t);
                     self.layers.targets[slot] = Some(t);
                 }
                 Move::Create { slot, size } => self.layers.targets[slot] = Some(self.make_target(device, size)),
@@ -473,7 +507,9 @@ impl Renderer {
         Target { texture, view, projection,
             identity: self.layers.allocations, composite_parent: None,
             quad: Self::instance_buffer(device, 1), base, composite, images: Vec::new(), glyphs: Vec::new(), image_generation: u64::MAX, blur: None,
-            cache: None, last_used: 0, content_size: [0.0; 2] }
+            cache: None, last_used: 0, content_size: [0.0; 2], binding: self.layers.bindings,
+            #[cfg(test)]
+            outline_rows: self.uber.outlines().map_or(0, wgpu::Texture::height) }
     }
 
     /// Draws what each layer's disposition says: its target's descriptor, its blur, and the quad
@@ -490,6 +526,9 @@ impl Renderer {
                     if cache.is_some() { t.last_used = stamp; }
                     let mut quad = Instance::begin_layer(rect, l.clip, LayerSpec {
                         opacity: l.opacity, blend: l.blend, ..Default::default() });
+                    // A hit composites the same turned quad a miss drew: the turn belongs to the
+                    // scope, not to the pass that filled its texture.
+                    if let Some((angle, pivot)) = l.turn { quad = quad.turned(angle, pivot); }
                     quad.fade = l.fade;
                     if (t.content_size[0] - rect[2]).abs() > 0.5 || (t.content_size[1] - rect[3]).abs() > 0.5 {
                         quad.uv = [0.0, 0.0, t.content_size[0], t.content_size[1]];
@@ -597,16 +636,28 @@ impl Renderer {
 
     pub(super) fn images_changed(&mut self) { self.layers.image_generation += 1; }
 
-    /// Makes every target's bind groups again (a new outline texture): the base one here, its
-    /// composite and image and glyph pages at the next `prepare_layers`.
+    /// Makes every live target's bind groups again (a new atlas or outline texture), and starts a
+    /// generation: the slots and retained caches bind it here, a parked target binds it when a
+    /// layer takes it back, and a spare no layer takes again makes nothing.
     pub(super) fn rebind_layers(&mut self, device: &wgpu::Device) {
+        self.layers.bindings += 1;
+        let generation = self.layers.bindings;
         let (layout, globals, outlines, atlas) = (&self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas);
         for t in self.layers.targets.iter_mut().flatten().chain(&mut self.layers.retained) {
-            t.base = Self::bind_group(device, layout, globals, outlines, atlas, atlas, Some(&t.projection));
-            // No target's identity is 0, so the composite is made again.
-            t.composite_parent = Some(0);
-            t.image_generation = u64::MAX;
+            rebind_target(device, layout, globals, outlines, atlas, t, generation);
+            #[cfg(test)]
+            { self.layers.binds += 1; }
         }
+    }
+
+    /// Binds `t` to the atlas and outline texture this frame draws with, if it was made or parked
+    /// against an earlier generation.
+    fn rebind_if_stale(&mut self, device: &wgpu::Device, t: &mut Target) {
+        let generation = self.layers.bindings;
+        if t.binding == generation { return; }
+        rebind_target(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, t, generation);
+        #[cfg(test)]
+        { self.layers.binds += 1; }
     }
 
     pub(super) fn refresh_layer_bindings(&mut self, device: &wgpu::Device) {
@@ -724,10 +775,14 @@ impl Renderer {
                 if l.clip != NO_CLIP {
                     let (origin, size) = self.target_frame(target);
                     let edge = |v: f32, o: f32, max: u32| (v - o).clamp(0.0, max as f32) as u32;
-                    let (x0, y0) = (edge(l.clip[0].floor(), origin[0], size[0]), edge(l.clip[1].floor(), origin[1], size[1]));
-                    let (x1, y1) = (edge(l.clip[2].ceil(), origin[0], size[0]), edge(l.clip[3].ceil(), origin[1], size[1]));
+                    let (mut x0, mut y0) = (edge(l.clip[0].floor(), origin[0], size[0]), edge(l.clip[1].floor(), origin[1], size[1]));
+                    let (mut x1, mut y1) = (edge(l.clip[2].ceil(), origin[0], size[0]), edge(l.clip[3].ceil(), origin[1], size[1]));
+                    // Inside an enclosing inline clip: both apply.
+                    let outer = pass.scissor();
+                    if let Some([ox, oy, ow, oh]) = outer {
+                        (x0, y0, x1, y1) = (x0.max(ox), y0.max(oy), x1.min(ox + ow), y1.min(oy + oh));
+                    }
                     if x1 > x0 && y1 > y0 {
-                        let outer = pass.scissor();
                         pass.set_scissor(Some([x0, y0, x1 - x0, y1 - y0]), size);
                         self.draw_layer_range(pass, format, l.begin + 1..l.end, target, hook);
                         pass.set_scissor(outer, size);
@@ -756,7 +811,11 @@ impl Renderer {
                 let before = s.before_instance(index);
                 if before < range.start || before > range.end || (before == range.end && !include_end) { continue; }
                 self.draw_with_effects(pass, format, cursor..before, target, hook);
-                s.draw_blended(pass, index, format, self.layer_blend(target));
+                // Only the window's own pass can punch a video's place out for its layer.
+                match target {
+                    None => s.draw_main(pass, index, format, self.layer_blend(target)),
+                    Some(_) => s.draw_isolated(pass, index, format, self.layer_blend(target)),
+                }
                 cursor = before;
             }
         }

@@ -519,7 +519,7 @@ impl Gpu {
                     .using_alignment(adapter_limits)
             }
         };
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let made = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rune"),
             required_features,
             required_limits,
@@ -531,7 +531,12 @@ impl Gpu {
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: Default::default(),
         }))
-        .map_err(|error| format!("no GPU device: {error}"))
+        .map_err(|error| format!("no GPU device: {error}"));
+        #[cfg(feature = "alloc-sites")]
+        if let Ok((device, _)) = &made {
+            report_gpu_allocations(device.clone());
+        }
+        made
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1291,4 +1296,35 @@ mod prewarm_tests {
         let described = crate::gpu::backend::describe(&gpu.device);
         assert!(described.starts_with("Rune's Metal backend on ") && described.ends_with("(the default)"), "{described}");
     }
+}
+
+/// With `alloc-sites` (a measuring build), every heap dump also lists what the device holds by kind
+/// (`textures <count> <bytes>`, `buffers <count> <bytes>`, views, bind groups, pipelines, command
+/// encoders, shader modules, memory allocations) and its suballocator's allocations by label.
+#[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
+fn report_gpu_allocations(device: wgpu::Device) {
+    procwatch::alloc::sites::contribute("gpu", move || {
+        // What the device holds, by kind (wgpu's counters: committed resources count here too).
+        let c = device.get_internal_counters().hal;
+        let mut out = format!(
+            "textures {} {}\nbuffers {} {}\nviews {}\nbind_groups {}\npipelines {}\nencoders {}\nshader_modules {}\nallocations {}\n",
+            c.textures.read(),
+            c.texture_memory.read(),
+            c.buffers.read(),
+            c.buffer_memory.read(),
+            c.texture_views.read(),
+            c.bind_groups.read(),
+            c.render_pipelines.read(),
+            c.command_encoders.read(),
+            c.shader_modules.read(),
+            c.memory_allocations.read()
+        );
+        if let Some(r) = device.generate_allocator_report() {
+            out.push_str(&format!("gpu {} {} {}\n", r.total_allocated_bytes, r.total_reserved_bytes, r.blocks.len()));
+            for a in &r.allocations {
+                out.push_str(&format!("alloc {} {}\n", a.size, a.name));
+            }
+        }
+        out
+    });
 }

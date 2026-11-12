@@ -141,6 +141,22 @@ fn prev_char(s: &str, i: usize) -> usize {
     s[..i].grapheme_indices(true).next_back().map_or(0, |(j, _)| j)
 }
 
+/// Where Backspace deletes back to from `i`, as Chromium's `BackspaceStateMachine` and native
+/// fields do: one code point (a combining accent, a Thai or Indic vowel sign, the last jamo of
+/// a decomposed syllable), so a typist fixes the last thing they typed without retyping the
+/// cluster; but a CR LF and an emoji sequence (a variation selector, a skin tone, a keycap, a
+/// flag's pair, a tag sequence, a ZWJ sequence of emoji) go whole.
+fn prev_backspace(s: &str, i: usize) -> usize {
+    let start = prev_char(s, i);
+    let cluster = &s[start..i];
+    let emoji = cluster.chars().any(|c| matches!(c as u32, 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF | 0xE0020..=0xE007F))
+        || (cluster.contains('\u{200D}') && cluster.chars().any(crate::text::is_pictographic));
+    if cluster == "\r\n" || emoji {
+        return start;
+    }
+    s[..i].char_indices().next_back().map_or(0, |(j, _)| j)
+}
+
 fn next_char(s: &str, i: usize) -> usize {
     use unicode_segmentation::UnicodeSegmentation;
     s[i..].graphemes(true).next().map_or(i, |g| i + g.len())
@@ -389,9 +405,32 @@ impl TextEdit {
         self.composition != ime::Composition::Idle
     }
 
-    /// Ends the input method's composition without committing it, as a blur does.
+    /// The clause the input method is converting, a byte range of the preedit, when it marks
+    /// one.
+    pub fn preedit_target(&self) -> Option<(usize, usize)> {
+        self.composition.target()
+    }
+
+    /// Ends the input method's composition without writing it, as an edit replacing the text
+    /// under it does.
     pub fn cancel_composition(&mut self) {
-        self.composition.cancel();
+        let _ = ime::step(&mut self.composition, ime::Event::Cancel);
+    }
+
+    /// Writes what the composition shows into the text and ends it, as a field that loses
+    /// focus or the window mid-composition keeps it (a browser's field and an `NSTextView`
+    /// do). True when there was one. The runtime tells the platform's input method to drop its
+    /// own copy.
+    pub fn finish_composition(&mut self) -> bool {
+        if self.secure { self.cancel_composition(); return false; }
+        let mut finished = false;
+        for effect in ime::step(&mut self.composition, ime::Event::Finish) {
+            let ime::Effect::Commit(mut s) = effect;
+            self.commit_composed(&s);
+            s.zeroize();
+            finished = true;
+        }
+        finished
     }
 
     pub(crate) fn clear_typing_style(&mut self) {

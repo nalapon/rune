@@ -29,6 +29,7 @@ mod atlas;
 mod atlas_fill;
 pub(crate) use atlas_fill::QueuedFill;
 mod case;
+mod colr;
 mod color_icon;
 mod cursor;
 mod decorations;
@@ -97,6 +98,7 @@ pub(crate) use layout_cache::CachedElision;
 
 use default_fonts::DEFAULT_FONTS;
 use fallback::Route;
+pub(crate) use fallback::is_pictographic;
 use glyph_emit::Face;
 use hidden_axes::hidden_axes;
 use layout_cache::{Cache, Entry};
@@ -130,6 +132,12 @@ use system_fonts::{LoadedFiles, family_list, load_installed, load_system_mono, n
 use system_fonts::system_font_files;
 #[cfg(test)]
 use system_fonts::CJK_FONT_FILES;
+
+/// How strictly Japanese and Chinese lines break, one switch. `Strict` (JIS X 4051, UAX #14's
+/// default) never starts a line with a small kana (ぁ ッ ャ), ー or 々. `Normal` is Chromium's
+/// `line-break: auto`, which lets them start one. Native Japanese readers decide which reads
+/// better; this is the one place to change.
+const LINE_BREAK: parley::LineBreak = parley::LineBreak::Strict;
 
 /// Lean of a synthetic oblique, in degrees, for faces with no italic.
 const SYNTHETIC_OBLIQUE: u8 = 12;
@@ -311,7 +319,7 @@ impl TextSystem {
             }
         }
         // No system font loads here: each comes the first time a text needs it (`load_fallbacks`).
-        register_cjk_fallbacks(&mut collection, &registered, families);
+        let cjk = register_cjk_fallbacks(&mut collection, &registered, families);
         #[cfg(target_arch = "wasm32")]
         let families = if fonts.is_empty() { ("Inter", "IBM Plex Mono") } else { families };
         let (sans, mono) = families::slots(families.0, families.1);
@@ -341,7 +349,7 @@ impl TextSystem {
             slot_system_mono: names_system_mono(families.0) || names_system_mono(families.1),
             scripts: 0,
             font_files: LoadedFiles::new(),
-            fallbacks: system_fonts::Fallbacks::new(list),
+            fallbacks: system_fonts::Fallbacks::new(list, cjk),
             system_faces: Default::default(),
             installed: Default::default(),
             atlas: Atlas::new(),
@@ -518,7 +526,7 @@ impl TextSystem {
     /// Previously emitted quads must no longer be sampled after this call. Runtime
     /// calls this automatically; direct text/renderer users call it before shaping.
     pub fn begin_frame(&mut self) {
-        self.begin_frame_pinned(0);
+        let _ = self.begin_frame_pinned(0);
     }
 
     /// Forgets every text's raster path and cached glyph runs, so the next paint places every
@@ -528,14 +536,16 @@ impl TextSystem {
         self.glyph_cache = Default::default();
     }
 
-    pub(crate) fn begin_frame_pinned(&mut self, pinned_mask: u32) {
+    /// [`Self::begin_frame`] keeping the pages in `pinned_mask`. Returns when the window should
+    /// wake for the glyph mask cache's first write (`mask_cache`).
+    pub(crate) fn begin_frame_pinned(&mut self, pinned_mask: u32) -> Option<std::time::Duration> {
         // A subpixel mode draws grayscale until the renderer can blend by channel, and after it
         // says it can't.
         if self.requested.lcd() && self.requested.drawn(self.lcd_ok()) != self.smoothing {
             self.set_font_smoothing(self.requested);
         }
         self.atlas.begin_frame(pinned_mask);
-        self.mask_cache_frame();
+        let wake = self.mask_cache_frame(true);
         self.paths.begin_frame();
         self.glyph_cache.begin_frame();
         if self.color_bytes > COLOR_GLYPH_BUDGET {
@@ -556,6 +566,7 @@ impl TextSystem {
         }
         for c in self.color_glyphs.values_mut() { c.used = false; }
         self.color_icons.begin_frame();
+        wake
     }
 
     /// `shape` is [`shape_key`] of the same text when the caller already has it.
@@ -634,6 +645,8 @@ impl TextSystem {
             return l;
         }
         self.shaped += 1;
+        crate::marks::add("text.shaped", 1);
+        let _shape_ns = crate::marks::Timed::start("text.shape_ns", true);
         let _shape_time = crate::frame::profile::Scope::new(crate::frame::profile::Phase::Text);
         let mono_style = matches!(style.family, Family::Mono | Family::SystemMono);
         let tabs = if text.contains('\t') { mono_tab_stops(text, spans, mono_style) } else { Vec::new() };
@@ -649,7 +662,8 @@ impl TextSystem {
             text
         };
         let routes = fallback::routes(text);
-        self.load_fallbacks(text);
+        let language = language::of_text(text, self.language);
+        self.load_fallbacks(text, language);
         // `trak` tracking at the point size (see `trak.rs`), on top of `style.tracking`. An
         // explicit optical size `o` picks the entry instead, as Core Text tracks `o`-point text
         // scaled to the set size; spans scale the lookup with their size. Each style range gets
@@ -732,7 +746,6 @@ impl TextSystem {
             }
         };
         let mono = with_symbols(self.mono.as_str(), mono_scripts);
-        let language = self.language;
         // Routed clusters try their fallback first, then the run's own stack (mono spans included).
         // Each of the four {math, emoji} × {sans, mono} stacks is built at most once.
         let mut stacks: [Option<Vec<FontFamilyName<'_>>>; 4] = Default::default();
@@ -789,6 +802,7 @@ impl TextSystem {
                 b.push_default(parley::FontVariations::List(std::borrow::Cow::Owned(settings)));
             }
             b.push_default(LineHeight::Absolute(style.line_px()));
+            b.push_default(StyleProperty::LineBreak(LINE_BREAK));
             if wrap_anywhere {
                 b.push_default(StyleProperty::OverflowWrap(parley::OverflowWrap::Anywhere));
             }
