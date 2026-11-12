@@ -42,7 +42,7 @@ pub(super) enum Action {
     KeyUp(KeyEvent),
     /// A wheel delta at window point (x, y) for the `on_wheel` handlers at the pointer,
     /// innermost first (`runtime/input/gesture.rs`).
-    Wheel(u64, Vec<String>, crate::WheelEvent),
+    Wheel(crate::machine::Attempt, Vec<String>, crate::WheelEvent),
     Gesture(Vec<String>, gesture_dispatch::Gesture),
     Ime(Ime),
     Paste(crate::ClipboardContent, Option<Option<String>>),
@@ -175,7 +175,7 @@ fn stall_path(action: &Action) -> Option<&str> {
     }
 }
 
-pub(super) fn merge(tx: &mut Tx, one: Tx) {
+pub(crate) fn merge(tx: &mut Tx, one: Tx) {
     tx.pick_reads.extend(one.pick_reads);
     tx.paste |= one.paste;
     tx.clipboard_reads.extend(one.clipboard_reads);
@@ -206,6 +206,7 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     tx.toggle_full_screen |= one.toggle_full_screen;
     tx.keys.extend(one.keys);
     if one.title.is_some() { tx.title = one.title; }
+    if one.announce.is_some() { tx.announce = one.announce; }
     tx.playground.extend(one.playground);
     tx.open_urls.extend(one.open_urls);
     tx.srgb_blend = one.srgb_blend.or(tx.srgb_blend);
@@ -218,13 +219,9 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
         tx.select = one.select;
         tx.select_from_change = one.select_from_change;
     }
-    tx.instant |= one.instant;
-    tx.settle |= one.settle;
+    tx.commit = tx.commit.merge(one.commit);
     tx.follow_edge |= one.follow_edge;
-    if one.motion.is_some() {
-        tx.motion = one.motion;
-        tx.motion_curve = one.motion_curve;
-    }
+    tx.motion = one.motion.or(tx.motion);
     tx.color_motion = one.color_motion.or(tx.color_motion);
 }
 
@@ -324,7 +321,7 @@ impl<S: 'static> Runtime<S> {
                 Some(path) => {
                     self.set_focus(Some(path), false);
                     self.focus.step(focus_machine::FocusEvent::Hover(true));
-                    one.instant = true;
+                    one.commit = one.commit.instant();
                     true
                 }
                 None => {
@@ -350,7 +347,7 @@ impl<S: 'static> Runtime<S> {
                 true
             }
             Action::FarFromBottom(path, far) => {
-                let Some((_, f)) = self.node(&path).and_then(|n| n.handlers.on_far_from_bottom.clone()) else { return false };
+                let Some((_, _, f)) = self.node(&path).and_then(|n| n.handlers.on_far_from_bottom.clone()) else { return false };
                 f(states!(self), far);
                 true
             }
@@ -422,7 +419,7 @@ impl<S: 'static> Runtime<S> {
             Action::Drag(path, mut d, button) | Action::DragRepeat(path, mut d, button) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.on_drag.clone()) else { return false };
                 if d.phase == Phase::Move {
-                    one.instant = true;
+                    one.commit = one.commit.instant();
                 }
                 one.button = button;
                 one.drag_repeat = repeat;
@@ -511,10 +508,8 @@ impl<S: 'static> Runtime<S> {
         let live_only = std::mem::take(&mut one.live_only);
         if live_only && live_label.is_some() {
             // A handler that asks for no commit cannot change another handler's animation.
-            one.instant = false;
-            one.settle = false;
+            one.commit = Commit::Animate;
             one.motion = None;
-            one.motion_curve = None;
             one.follow_edge = false;
             one.color_motion = None;
         }

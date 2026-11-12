@@ -93,6 +93,7 @@ atoms! {
     Version = "version",
     RenderRow = "renderRow",
     RowKey = "rowKey",
+    RowVersions = "rowVersions",
     OnVisibleRows = "onVisibleRows",
     OnHover = "onHover",
     HoverTransition = "hoverTransition",
@@ -530,8 +531,14 @@ impl Props {
             }
             Atom::Disabled => self.disabled = flag(v)?,
             Atom::HelpSide => {
-                if matches!(v, Value::Str("top")) {
-                    with(e, El::help_above);
+                let side = match v {
+                    Value::Str("top") => Some(rune::Side::Top),
+                    Value::Str("left") => Some(rune::Side::Left),
+                    Value::Str("right") => Some(rune::Side::Right),
+                    _ => None,
+                };
+                if let Some(side) = side {
+                    with(e, |e| e.help_side(side));
                 }
             }
             Atom::FadeOut => self.fade_out = flag(v)?,
@@ -577,7 +584,7 @@ impl Props {
                 })
             }
             // Read by the node that takes them; elsewhere they mean nothing.
-            Atom::OnPress | Atom::OnHover | Atom::Count | Atom::EstimatedRowHeight | Atom::Version | Atom::RenderRow | Atom::RowKey | Atom::OnVisibleRows => {
+            Atom::OnPress | Atom::OnHover | Atom::Count | Atom::EstimatedRowHeight | Atom::Version | Atom::RenderRow | Atom::RowKey | Atom::RowVersions | Atom::OnVisibleRows => {
                 env.warn_once(format!("{name} has no effect on this node"));
             }
         }
@@ -679,5 +686,13 @@ pub(crate) fn name(v: Value<'_>) -> &'static str {
 
 /// A number as Luau prints it: `3`, not `3.0`.
 pub(crate) fn format_num(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 { format!("{}", n as i64) } else { n.to_string() }
+    let mut s = String::new();
+    push_num(&mut s, n);
+    s
+}
+
+/// [`format_num`] onto the end of `out`.
+pub(crate) fn push_num(out: &mut String, n: f64) {
+    use std::fmt::Write;
+    let _ = if n.fract() == 0.0 && n.abs() < 1e15 { write!(out, "{}", n as i64) } else { write!(out, "{n}") };
 }

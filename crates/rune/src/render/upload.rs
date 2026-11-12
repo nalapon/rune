@@ -90,13 +90,16 @@ fn same(a: &[Instance], b: &[Instance]) -> bool {
 fn pack((w, h): (u32, u32)) -> u64 { u64::from(w) << 32 | u64::from(h) }
 
 impl Renderer {
-    /// Records pending uploads into `encoder`, ahead of the renderer's commands in it.
+    /// Records pending uploads into `encoder`, ahead of the renderer's commands in it, and the
+    /// atlas fills staged after them.
     pub(super) fn flush_uploads(&self, encoder: &mut wgpu::CommandEncoder) {
         if let Some(s) = &self.uploads.staging { s.flush(encoder); }
+        self.encode_fills(encoder);
     }
 
-    /// Submits pending uploads ahead of commands already recorded.
+    /// Submits pending uploads (and atlas fills) ahead of commands already recorded.
     pub(super) fn submit_uploads(&self) {
+        if self.fills.lock().unwrap_or_else(|e| e.into_inner()).is_some() { return self.submit_fills(); }
         if let Some(s) = &self.uploads.staging { s.submit(); }
     }
 
@@ -207,6 +210,7 @@ impl Renderer {
             atlas.invalidate();
         }
         atlas.outlines.set_support(self.uber.support());
+        self.lcd_frame = atlas.lcd && self.lcd_ready(device);
         if let Some(rows) = atlas.dirty.take() {
             atlas.rows_uploaded(0, rows);
             Self::write_rows(&staging, &self.atlas, &atlas.data, rows);
@@ -267,9 +271,24 @@ impl Renderer {
         self.prepare_backdrop_blur(device, queue, viewport);
     }
 
+    /// A window's or overlay's first native surface: its renderer's pipeline compiles on a thread
+    /// of its own, and `done` runs once it's ready (the window's live wake, so the next frame
+    /// draws it). Until then `prepare_surfaces` draws no surface: a clip that's opening has no
+    /// picture yet anyway. Without this call, `prepare_surfaces` compiles in place.
+    pub(crate) fn build_surfaces(&mut self, device: &wgpu::Device, draws: &[crate::native_surface::SurfaceDraw], done: impl FnOnce() + Send + 'static) {
+        if draws.is_empty() || self.surfaces.is_some() || self.surfaces_building.is_some() { return; }
+        self.surfaces_building = Some(crate::native_surface::SurfaceRenderer::build(device, self.format, Box::new(done)));
+    }
+
     pub fn prepare_surfaces(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &[crate::native_surface::SurfaceDraw], viewport: (u32,u32)) {
-        if !draws.is_empty() && self.surfaces.is_none() {
-            let mut surfaces = crate::native_surface::SurfaceRenderer::new(device, self.format);
+        let built = match &self.surfaces_building {
+            Some(building) => crate::native_surface::SurfaceRenderer::finish(device, building),
+            None => None,
+        };
+        if built.is_some() { self.surfaces_building = None; }
+        if self.surfaces.is_none() && self.surfaces_building.is_some() { return; }
+        if (!draws.is_empty() || built.is_some()) && self.surfaces.is_none() {
+            let mut surfaces = built.unwrap_or_else(|| crate::native_surface::SurfaceRenderer::new(device, self.format));
             surfaces.set_srgb_blend(self.srgb_blend);
             surfaces.set_staging(self.uploads.staging(device, queue));
             for (format, _) in &self.extra { surfaces.add_format(device, *format); }

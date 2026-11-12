@@ -9,8 +9,6 @@ compile_error!("web does not support Rune's hot or native-file-dialog features; 
 mod a11y;
 mod app;
 mod cold;
-mod cursor;
-mod desktop;
 mod flight;
 mod frame;
 mod gpu;
@@ -19,18 +17,15 @@ mod latest;
 mod native_menu;
 mod open_url;
 mod overlay;
-mod pixels;
 mod platform;
 mod popup_menu;
 mod quit;
 mod recorder;
-mod relaunch;
 mod shortcuts;
 mod states;
 mod system_material;
 #[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
 mod term;
-mod titlebar;
 mod video;
 mod window;
 
@@ -49,6 +44,7 @@ pub mod image;
 pub mod labels;
 pub mod live;
 pub mod machine;
+pub mod marks;
 pub mod memo;
 pub mod motion_gate;
 pub mod native_surface;
@@ -59,13 +55,20 @@ pub mod rewind;
 pub mod runtime;
 pub mod shape;
 pub mod spell;
+pub mod task;
 pub mod text;
 pub mod theme;
 pub mod time;
 pub mod tok;
+pub mod tracked;
 pub mod tooling;
 pub mod tray;
-pub mod windows;
+
+pub(crate) use image::pixels;
+pub(crate) use input::cursor;
+pub(crate) use quit::relaunch;
+pub(crate) use tooling::virtual_desktop as desktop;
+pub(crate) use window::titlebar;
 
 /// AccessKit's types, for [`Runtime::accessibility_tree`] and [`Runtime::accessibility_action`].
 pub use a11y::AccessibilityLink;
@@ -135,6 +138,7 @@ pub use el::layout_watch::ScrollPos;
 pub use el::motion::MotionIntent;
 pub use el::rich;
 pub use el::row;
+pub use el::rule;
 pub use el::spacer;
 pub use el::text;
 pub use el::text_input;
@@ -190,13 +194,14 @@ pub use latest::Latest;
 pub use live::Live;
 pub use live::LiveText;
 pub use live::Tween;
-pub use memo::memo;
+pub use memo::{memo, region, region_with};
+pub use tracked::Tracked;
 pub use native_menu::MenuError;
 pub use native_menu::MenuItem;
 pub use native_surface::NativeSurface;
 pub use native_surface::SurfaceFit;
 pub use open_url::OpenUrlError;
-pub use open_url::instance::single_instance;
+pub use open_url::instance::{release_instance, single_instance};
 pub use overlay::Availability;
 pub use overlay::OverlayHandle;
 pub use overlay::OverlaySpec;
@@ -217,6 +222,8 @@ pub use pixels::Pixels;
 pub use platform::accent::SystemAccent;
 pub use platform::accent::system_accent;
 pub use platform::app_icon::set_app_icon;
+#[cfg(target_os = "windows")]
+pub use platform::app_icon::set_app_icon_resource;
 #[cfg(target_vendor = "apple")]
 pub use platform::embed;
 #[cfg(target_os = "macos")]
@@ -243,6 +250,7 @@ pub use popup_menu::PopupItem;
 pub use popup_menu::PopupMenu;
 pub use popup_menu::PopupMenuError;
 pub use popup_menu::popup_menu_supported;
+pub use quit::fast_exit;
 pub use quit::quitting;
 pub use recorder::FakeMicrophone;
 pub use recorder::Level;
@@ -319,6 +327,7 @@ pub use text::FontSmoothing;
 pub use text::Icon;
 pub use text::Link;
 pub use text::LinkPaint;
+pub use text::SmoothingSupport;
 pub use text::Span;
 pub use text::TextCase;
 pub use text::TextHighlight;
@@ -354,6 +363,7 @@ pub use video::Player;
 pub use video::PlayerState;
 pub use video::Video;
 pub use window::WindowHandle;
+pub use window::spec as windows;
 pub use windows::AnyWindowSpec;
 pub use windows::ConfiguredWindowOptions;
 pub use windows::Display;
@@ -385,8 +395,11 @@ pub fn scene_clock() -> SceneClock {
 
 /// Runs `f` (a scene fn or `init`) with `clock` as the scene clock.
 pub(crate) fn with_scene_clock<T>(clock: SceneClock, f: impl FnOnce() -> T) -> T {
-    let before = SCENE_CLOCK.replace(clock);
-    let out = f();
-    SCENE_CLOCK.set(before);
-    out
+    struct Restore(SceneClock);
+    impl Drop for Restore {
+        fn drop(&mut self) { SCENE_CLOCK.set(self.0); }
+    }
+
+    let _restore = Restore(SCENE_CLOCK.replace(clock));
+    f()
 }

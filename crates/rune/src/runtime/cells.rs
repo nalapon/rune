@@ -7,6 +7,7 @@
 //! Radius shows only as round corners; shadows, blur, vector shapes and icons have no cell form.
 //! An element still in motion says so (`moving`), so its fills take fractional edges.
 use super::*;
+use crate::Span;
 use parley::PositionedLayoutItem;
 use std::rc::Rc;
 
@@ -113,20 +114,37 @@ fn url_of(id: &str) -> Option<Rc<str>> {
 }
 
 /// One laid-out cluster: its cell (x from the text's start, the line's top), its byte range in
-/// the drawn string, the cells it covers, and its style's ink (a span's index + 1, 0 for none).
+/// the drawn string, the cells it covers, and the span styling it.
 struct Laid {
     at: [f32; 2],
     range: std::ops::Range<usize>,
     width: u8,
-    ink: usize,
+    span: Option<Span>,
 }
 
 /// Every cluster of `layout` once, in visual order. A line's styled pieces (`GlyphRun`s) share
 /// their shaping run, so each run is walked once and each cluster takes the piece it falls in.
 /// Clusters go on whole cells as a terminal puts them: a wide one (advance over 1.25) takes two
 /// and pushes what follows, though the font may have laid it narrower.
-fn laid_clusters(layout: &parley::Layout<Ink>) -> Vec<Laid> {
+///
+/// A by-paragraph field's paragraphs each have a layout: theirs go below each other, their
+/// bytes mapped back onto the field's content and their inks onto the spans cut to them.
+fn laid_clusters(layout: &TextLayout, spans: &[Span]) -> Vec<Laid> {
     let mut out = Vec::new();
+    for piece in layout.view().pieces() {
+        let cut = piece.spans(spans);
+        let from = out.len();
+        piece_clusters(piece.layout, &cut, &mut out);
+        if piece.is_whole() { continue; }
+        for c in &mut out[from..] {
+            c.at[1] += piece.y.round();
+            c.range = piece.content(c.range.start)..piece.content(c.range.end);
+        }
+    }
+    out
+}
+
+fn piece_clusters(layout: &parley::Layout<Ink>, spans: &[Span], out: &mut Vec<Laid>) {
     for line in layout.lines() {
         let top = line.metrics().block_min_coord.round();
         let pieces: Vec<_> = line.items().filter_map(|item| match item {
@@ -145,14 +163,13 @@ fn laid_clusters(layout: &parley::Layout<Ink>) -> Vec<Laid> {
             for cluster in group[0].run().visual_clusters() {
                 let piece = group.iter().find(|g| x + 1e-3 >= g.offset() && x + 1e-3 < g.offset() + g.advance()).unwrap_or(group.last().unwrap_or(&group[0]));
                 let width = if cluster.advance() > 1.25 { 2 } else { 1 };
-                out.push(Laid { at: [cell, top], range: cluster.text_range(), width, ink: piece.style().brush.0 as usize });
+                out.push(Laid { at: [cell, top], range: cluster.text_range(), width, span: (piece.style().brush.0 as usize).checked_sub(1).and_then(|k| spans.get(k)).cloned() });
                 x += cluster.advance();
                 cell += f32::from(width);
             }
             col = Some(cell);
         }
     }
-    out
 }
 
 impl<S: 'static> Runtime<S> {
@@ -227,7 +244,7 @@ impl<S: 'static> Runtime<S> {
         let n = &self.nodes[i];
         let (spec, layout) = (n.text.as_ref()?, n.text_layout.as_ref()?);
         let (x0, x1) = (rect[0] + n.inset[0], rect[2] - n.inset[2]);
-        let mut origin = [text_x(spec, x0, x1, layout.full_width().ceil(), crate::el::Flow::of_layout(layout)), rect[1] + n.inset[1]];
+        let mut origin = [text_x(spec, x0, x1, layout.view().full_width().ceil(), layout.view().flow()), rect[1] + n.inset[1]];
         if n.input.as_ref().is_some_and(|i| i.single_line) {
             origin[0] -= self.input_scroll.get(&n.path).copied().unwrap_or(0.0);
         }
@@ -250,18 +267,18 @@ impl<S: 'static> Runtime<S> {
         }
         if spec.selectable && let Some((a, b)) = selectable::range_in(sel, i) {
             let (a, b) = laid(a, b);
-            let (bg, ink) = spec.selection_style.map_or((spec.selection, None), |st| st.pick(focused));
+            let (bg, ink) = spec.cold.selection_style.map_or((spec.cold.selection, None), |st| st.pick(focused));
             out.push((a, b, Deco::Select(bg, ink)));
         }
-        for h in &spec.highlights {
+        for h in &spec.cold.highlights {
             let (a, b) = at(h.start, h.end);
             out.push((a, b, Deco::Highlight(h.bg, h.fg)));
         }
-        for &(a, b, _) in &spec.strikes {
+        for &(a, b, _) in &spec.cold.strikes {
             let (a, b) = at(a, b);
             out.push((a, b, Deco::Strike));
         }
-        for l in &spec.links {
+        for l in &spec.cold.links {
             if let Some(url) = url_of(&l.id) {
                 let (a, b) = at(l.start, l.end);
                 out.push((a, b, Deco::Link(url)));
@@ -290,8 +307,8 @@ impl<S: 'static> Runtime<S> {
             None => spec.content.as_str().into(),
         };
         let decos = self.cell_decos(i, sel);
-        for c in laid_clusters(layout) {
-            let span = c.ink.checked_sub(1).and_then(|k| spec.spans.get(k));
+        for c in laid_clusters(layout, &spec.spans) {
+            let span = c.span.as_ref();
             let weight = span.and_then(|s| s.weight).unwrap_or(spec.style.weight);
             let mut style = CellStyle {
                 bold: weight >= 600.0,
@@ -334,7 +351,7 @@ impl<S: 'static> Runtime<S> {
         // The cell of the character at the caret's byte, or just past the one ending there.
         let at = caret_index(&inp.edit, &spec.content);
         let mut end = None;
-        for c in laid_clusters(layout) {
+        for c in laid_clusters(layout, &[]) {
             let cell = [origin[0] + c.at[0], origin[1] + c.at[1]];
             if c.range.start == at { return Some((cell, color)); }
             if c.range.end == at { end = Some([cell[0] + f32::from(c.width), cell[1]]); }

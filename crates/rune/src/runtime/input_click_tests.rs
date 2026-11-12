@@ -103,7 +103,7 @@ fn rect_of(rt: &Runtime<Form>, key: &str) -> [f32; 4] {
 /// Window point `(x, y)` at `frac` (`0.0..1.0`) across the glyph cluster at `byte` in `key`.
 fn point_in_cluster(rt: &Runtime<Form>, key: &str, byte: usize, frac: f32) -> (f32, f32) {
     let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some(key)).unwrap();
-    let l = n.text_layout.as_ref().unwrap();
+    let l = n.text_layout.as_ref().and_then(crate::text::TextLayout::single).unwrap();
     let s = rt.env.scale;
     let cl = parley::Cluster::from_byte_index(l, byte).unwrap();
     let x0 = cl.visual_offset().unwrap();
@@ -352,7 +352,7 @@ fn right_half_of_char_and_pill_trailing_padding_select_the_hit_word_and_pill() {
 
     // In "pills" ("@maya hello" where 0..5 is a pill), find the trailing inline box of "@maya".
     let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some("pills")).unwrap();
-    let l = n.text_layout.as_ref().unwrap();
+    let l = n.text_layout.as_ref().and_then(crate::text::TextLayout::single).unwrap();
     let s = rt.env.scale;
     let line = l.get(0).unwrap();
     let trail = line
@@ -512,4 +512,16 @@ fn presses_land_on_targets_inside_a_scrolled_viewport() {
     rt.pointer_up(100.0, 25.0);
     rt.frame(1.0 / 120.0);
     assert_eq!(rt.state, [4]);
+}
+
+#[test]
+fn a_field_that_stops_following_its_press_keeps_the_press_until_release() {
+    let mut c = InputClick::default();
+    c.capture = Capture::Held { dragging: Some("field".into()) };
+    c.steps.push_back(("field".into(), Step::Drag));
+    c.on_focus_change(Some("other"));
+    assert!(c.captured() && c.dragging_path().is_none(), "focus left: the drag stops, the press stays the field's");
+    assert!(matches!(c.steps.front(), Some((_, Step::Cancelled))), "its queued drag step does nothing");
+    assert!(c.end_press());
+    assert!(!c.captured() && !c.end_press(), "the release ends it once");
 }

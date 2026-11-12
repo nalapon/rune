@@ -20,6 +20,15 @@ struct Uniforms {
     // `Orient`: centred upright to centred buffer coordinates.
     orient: [f32; 4],
 }
+/// A renderer whose pipeline compiles on a thread of its own (`SurfaceRenderer::build`).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) struct Building {
+    format: wgpu::TextureFormat,
+    layout: wgpu::BindGroupLayout,
+    /// The compiled pipeline, once sent; None when the thread couldn't start.
+    built: Option<std::sync::mpsc::Receiver<wgpu::RenderPipeline>>,
+}
+
 pub(crate) struct Imported {
     frame: Arc<Frame>,
     textures: [wgpu::Texture; 2],
@@ -31,7 +40,13 @@ struct Prepared {
     uniform: wgpu::Buffer,
     imported: Arc<Imported>,
     surface: NativeSurface,
+    /// Bind groups this draw made for other textures, newest last: a decoder cycles a few, so
+    /// a new picture in one it drew before binds with no allocation.
+    binds: Vec<([wgpu::Texture; 2], wgpu::BindGroup)>,
 }
+
+/// Bind groups a draw keeps for textures it may show again (a video decoder's ring).
+const KEPT_BINDS: usize = 8;
 
 // Metal has a small limit on live counter sample buffers. Keep one query set and lease
 // disjoint pairs until their deferred resolve/readback completes, rather than allocating
@@ -85,9 +100,50 @@ impl SurfaceRenderer {
     pub fn new(_: &wgpu::Device, _: wgpu::TextureFormat) -> Self {
         panic!("native surfaces are unsupported on web")
     }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn build(_: &wgpu::Device, _: wgpu::TextureFormat, _: Box<dyn FnOnce() + Send>) -> Building {
+        panic!("native surfaces are unsupported on web")
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn finish(_: &wgpu::Device, _: &Building) -> Option<Self> {
+        None
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let layout = Self::bind_layout(device);
+        let pipeline = Self::pipeline(device, &layout, format, Blend::SourceOver);
+        Self::with_pipeline(device, format, layout, pipeline)
+    }
+
+    /// Starts compiling the renderer's pipeline on a thread of its own, and runs `done` once
+    /// it's ready. The shader compiler takes hundreds of milliseconds (FXC on Windows), which
+    /// on the UI thread froze a window's input and held the first picture back.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn build(device: &wgpu::Device, format: wgpu::TextureFormat, done: Box<dyn FnOnce() + Send>) -> Building {
+        let layout = Self::bind_layout(device);
+        let (sender, built) = std::sync::mpsc::sync_channel(1);
+        let (device_for, layout_for) = (device.clone(), layout.clone());
+        let spawned = std::thread::Builder::new().name("rune-video-pipeline".into()).spawn(move || {
+            let _ = sender.send(Self::pipeline(&device_for, &layout_for, format, Blend::SourceOver));
+            done();
+        });
+        Building { format, layout, built: spawned.is_ok().then_some(built) }
+    }
+
+    /// The renderer `building` made, once its pipeline is ready; a build whose thread couldn't
+    /// start compiles here.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn finish(device: &wgpu::Device, building: &Building) -> Option<Self> {
+        let pipeline = match &building.built {
+            Some(built) => built.try_recv().ok()?,
+            None => Self::pipeline(device, &building.layout, building.format, Blend::SourceOver),
+        };
+        Some(Self::with_pipeline(device, building.format, building.layout.clone(), pipeline))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, layout: wgpu::BindGroupLayout, pipeline: wgpu::RenderPipeline) -> Self {
         let timing_pool = device.features().contains(wgpu::Features::TIMESTAMP_QUERY).then(|| {
             Arc::new(TimingPool {
                 queries: device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -117,36 +173,12 @@ impl SurfaceRenderer {
                 }
             })
             .expect("video completion thread");
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("video"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                texture_entry(1),
-                texture_entry(2),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("video linear"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let pipeline = Self::pipeline(device, &layout, format, Blend::SourceOver);
         Self {
             device: device.clone(),
             timing_pool,
@@ -168,6 +200,33 @@ impl SurfaceRenderer {
             #[cfg(target_os = "windows")]
             shared: None,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("video"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture_entry(1),
+                texture_entry(2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        })
     }
 
     pub fn set_srgb_blend(&mut self, enabled: bool) {
@@ -239,7 +298,8 @@ impl SurfaceRenderer {
         // Release an unsubmitted preparation before acquiring its replacement. Submitted
         // slots stay leased by their completion callbacks, including the deferred resolve.
         self.queries = None;
-        if !draws.is_empty() {
+        // GPU times only for a surface someone watches: resolving them costs a submission a frame.
+        if draws.iter().any(|d| d.surface.observed()) {
             self.queries = self.timing_pool.as_ref().and_then(TimingPool::take);
         }
         self.cache.retain(|key, _| draws.iter().any(|d| d.surface.key() == *key));
@@ -296,12 +356,25 @@ impl SurfaceRenderer {
                 sampling: [if exact { 1.0 } else { 0.0 }, f.size[0] as f32, f.size[1] as f32, if mirrored { 1.0 } else { 0.0 }],
                 orient: f.orient.0.map(f32::from),
             };
-            if let Some(p) = self.draws.get_mut(count).filter(|p| Arc::ptr_eq(&p.imported, &imported)) {
+            // The same draw with a new picture keeps its uniform buffer, and its bind group too
+            // when the picture is in textures it bound before.
+            if let Some(p) = self.draws.get_mut(count).filter(|p| p.surface.key() == d.surface.key() || Arc::ptr_eq(&p.imported, &imported)) {
                 *p.drawn.get_mut() = false;
                 match &self.staging {
                     Some(s) => s.write_buffer(&p.uniform, 0, bytemuck::bytes_of(&u)),
                     None => queue.write_buffer(&p.uniform, 0, bytemuck::bytes_of(&u)),
                 }
+                if !Arc::ptr_eq(&p.imported, &imported) && p.imported.textures != imported.textures {
+                    let old = std::mem::replace(&mut p.bind, match p.binds.iter().position(|(t, _)| *t == imported.textures) {
+                        Some(i) => p.binds.remove(i).1,
+                        None => bind_group(device, &self.layout, &self.sampler, &p.uniform, &imported.textures),
+                    });
+                    p.binds.push((p.imported.textures.clone(), old));
+                    if p.binds.len() > KEPT_BINDS {
+                        p.binds.remove(0);
+                    }
+                }
+                p.imported = imported;
                 p.before = d.before_instance;
                 p.surface = d.surface.clone();
             } else {
@@ -310,17 +383,7 @@ impl SurfaceRenderer {
                     contents: bytemuck::bytes_of(&u),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 });
-                let views = imported.textures.each_ref().map(|t| t.create_view(&Default::default()));
-                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("video frame"),
-                    layout: &self.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[0]) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    ],
-                });
+                let bind = bind_group(device, &self.layout, &self.sampler, &uniform, &imported.textures);
                 let p = Prepared {
                     drawn: std::sync::atomic::AtomicBool::new(false),
                     before: d.before_instance,
@@ -328,6 +391,7 @@ impl SurfaceRenderer {
                     uniform,
                     imported,
                     surface: d.surface.clone(),
+                    binds: Vec::new(),
                 };
                 if count < self.draws.len() {
                     self.draws[count] = p;
@@ -338,6 +402,10 @@ impl SurfaceRenderer {
             count += 1;
         }
         self.draws.truncate(count);
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &mut self.shared {
+            shared.forget_gone();
+        }
         #[cfg(target_os = "macos")]
         if let Some(i) = &self.importer {
             i.flush();
@@ -384,6 +452,13 @@ impl SurfaceRenderer {
                     self.shared = Some(windows::Importer::new(device)?);
                 }
                 self.shared.as_mut().unwrap().import(queue, t)?
+            }
+            #[cfg(target_os = "windows")]
+            Source::Decoded(planes, value) => {
+                if self.shared.is_none() {
+                    self.shared = Some(windows::Importer::new(device)?);
+                }
+                self.shared.as_mut().unwrap().import_decoded(queue, planes, *value)?
             }
         };
         Ok(Imported { frame, textures })
@@ -545,8 +620,22 @@ impl SurfaceRenderer {
             });
         }
         let index = queue.submit([encoder.finish()]);
+        self.release_decoded(queue);
         let _ = self.completion.try_send(());
         index
+    }
+
+    /// Decoded video pictures this submission drew may be written again once it's done.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn release_decoded(&self, queue: &wgpu::Queue) {
+        #[cfg(target_os = "windows")]
+        for p in self.draws.iter().filter(|p| p.drawn.load(std::sync::atomic::Ordering::Relaxed)) {
+            if let Source::Decoded(planes, value) = &p.imported.frame.source {
+                windows::release_decoded(queue, planes, *value);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = queue;
     }
 }
 
@@ -589,6 +678,19 @@ fn upload(
         desc.size,
     );
     texture
+}
+fn bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, uniform: &wgpu::Buffer, textures: &[wgpu::Texture; 2]) -> wgpu::BindGroup {
+    let views = textures.each_ref().map(|t| t.create_view(&Default::default()));
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("video frame"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[0]) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
 }
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
