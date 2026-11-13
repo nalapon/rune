@@ -66,7 +66,9 @@ mod glyph_emit;
 mod hash;
 mod hidden_axes;
 mod inline_fit;
-mod hairline;
+mod aaa;
+mod area;
+mod convex;
 pub(crate) mod icon;
 mod layout_cache;
 mod macos;
@@ -76,6 +78,9 @@ mod measure;
 pub(crate) mod outline;
 pub use outline::Outline;
 mod pill_chips;
+mod pretty;
+pub use pretty::set_pretty_wrap;
+pub(crate) use pretty::pretty_wrap;
 mod rich_layout;
 mod run;
 pub(crate) use pill_chips::{bare_icons, pill_chips};
@@ -98,6 +103,7 @@ pub(crate) use families::choose_families;
 pub use measure::{FamiliesGuard, TextInk, advance, content_widths, font_epoch, ink, measure, measure_with, with_families};
 #[cfg(target_arch = "wasm32")]
 pub(crate) use measure::line_starts;
+pub(crate) use measure::lend;
 pub use rich_layout::RichLayoutOptions;
 pub use run::{Run, RunLayout};
 pub(crate) use case::Source as CaseSource;
@@ -113,7 +119,7 @@ pub(crate) use layout_cache::Keep;
 pub(crate) use paragraphs::{ParagraphLayout, Piece, TextFlow, TextLayout};
 #[cfg(test)]
 use layout_cache::STALE_BYTES;
-pub use icon::{Icon, icon_coverage, set_icon_swap, set_icon_swap_size};
+pub use icon::{Icon, icon_coverage, icon_coverage_placed, set_icon_swap, set_icon_swap_size};
 pub(crate) use icon::Facing;
 use icon::rasterize_icon;
 use rich_layout::mono_tab_stops;
@@ -132,7 +138,6 @@ use atlas::{AtlasGlyph, COLOR_GLYPH_BUDGET, ColorGlyph, GlyphKey, GlyphMap, Rast
 use atlas::{MAX_OVERFLOW_PAGES, MAX_STEADY_PAGES};
 #[cfg(test)]
 pub(crate) use glyph_emit::GLIDE_PHASES;
-use line_break::break_lines_with_blocks;
 use span::PILL_BOX;
 use system_fonts::{LoadedFiles, family_list, load_installed, load_system_mono, named_list, names_system_mono, register_cjk_fallbacks};
 #[cfg(any(test, not(target_arch = "wasm32")))]
@@ -536,7 +541,7 @@ impl TextSystem {
     /// platform: 1 (coverage as is) on macOS and iOS, and a browser's text gamma for `Off`
     /// elsewhere.
     pub fn coverage_exponent(&self, fill: [f32; 4]) -> f32 {
-        let apple = cfg!(any(target_os = "macos", target_os = "ios"));
+        let apple = coretext_match::apple_coverage();
         coretext_match::coverage_exponent(self.smoothing, fill, apple, cfg!(target_os = "windows"))
     }
 
@@ -625,6 +630,7 @@ impl TextSystem {
         max_width: Option<f32>,
         align: Alignment,
         wrap_anywhere: bool,
+        pretty: bool,
         keep: Keep,
         base: parley::BaseDirection,
     ) -> Rc<Layout<Ink>> {
@@ -636,7 +642,9 @@ impl TextSystem {
         // breaking adds the width, alignment and block indents. A layout cached at one width
         // is re-broken at another rather than shaped again.
         let shape_key = shape.unwrap_or_else(|| hash::directed(shape_key(text, spans, style, scale, wrap_anywhere, pills), base));
-        let key = hash::break_key(shape_key, max_width, align, has_indented_blocks.then_some(blocks));
+        // Pretty wrapping breaks only wrapped proportional text again.
+        let pretty = pretty && max_width.is_some() && !matches!(style.family, Family::Mono | Family::SystemMono);
+        let key = hash::break_key(shape_key, max_width, align, has_indented_blocks.then_some(blocks)) ^ if pretty { 0x7072_6574_7479_0001 } else { 0 };
         let g = self.generation;
         if cache && let Some(Entry { value: l, used, .. }) = self.layouts.get_mut(&key) {
             *used = g;
@@ -662,13 +670,8 @@ impl TextSystem {
                 !r.is_empty() && text.is_char_boundary(r.start) && text.is_char_boundary(r.end) && !text.as_bytes()[r.clone()].contains(&b'\n')
             })
             .collect();
-        let break_lines = |layout: &mut Layout<Ink>| {
-            if has_indented_blocks || !pills.is_empty() {
-                break_lines_with_blocks(layout, blocks, style.size, scale, max_width);
-            } else {
-                layout.break_all_lines(max_width);
-            }
-        };
+        let indented = has_indented_blocks || !pills.is_empty();
+        let break_lines = |layout: &mut Layout<Ink>| line_break::break_new(layout, text, blocks, indented, style.size, scale, max_width, pretty);
         if cache
             && let Some(prev) = self.shapes.get(&shape_key).copied()
             && let Some(Entry { value: shaped, used, .. }) = self.layouts.get(&prev)

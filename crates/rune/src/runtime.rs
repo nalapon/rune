@@ -195,6 +195,11 @@ use scroll_mode::ScrollMode;
 mod scroll_watch;
 #[doc(hidden)]
 pub use scroll_watch::scroll_watch_state;
+#[path = "runtime/input/autoscroll.rs"]
+mod autoscroll;
+#[cfg(target_os = "linux")]
+#[path = "runtime/input/primary_selection.rs"]
+mod primary_selection;
 #[path = "runtime/input/gesture.rs"]
 mod gesture_dispatch;
 #[path = "runtime/input/key_releases.rs"]
@@ -506,6 +511,13 @@ pub struct Runtime<S: 'static> {
     press: capture::Press,
     /// The secondary button's press, held beside it.
     secondary: capture::Secondary,
+    /// The middle or secondary button's pressed look (`capture::Tint`).
+    tint: capture::Tint,
+    /// Linux's primary selection (`runtime/input/primary_selection.rs`).
+    #[cfg(target_os = "linux")]
+    pub(crate) primary: primary_selection::PrimarySelection,
+    /// The middle button's autoscroll (`runtime/input/autoscroll.rs`).
+    autoscroll: autoscroll::Autoscroll,
     drag_data: f32,
     pub instances: Vec<Instance>,
     /// Per instance, the `El::mark` of its nearest marked node (0 for none). Filled only while
@@ -521,6 +533,10 @@ pub struct Runtime<S: 'static> {
     hits: Vec<(NodeId, [f32; 4])>,
     overlay_hits: Vec<[f32; 4]>,
     glyph_scratch: Vec<GlyphQuad>,
+    /// Each still text's quads as it drew them, by node and layout, and the paint they were last
+    /// used in (`paint_content`): a frame that draws it the same copies them.
+    text_quads: HashMap<(NodeId, usize), (Rc<parley::Layout<crate::text::Ink>>, crate::el::grid::DrawnRow, u64)>,
+    quads_frame: u64,
     deco_scratch: Vec<PaintedDeco>,
     inh_scratch: Vec<Inh>,
     /// `motion_elements`' per-node scratch, kept so a frame doesn't allocate.
@@ -925,6 +941,10 @@ impl<S: 'static> Runtime<S> {
             pointer: None,
             press: Default::default(),
             secondary: Default::default(),
+            tint: Default::default(),
+            #[cfg(target_os = "linux")]
+            primary: Default::default(),
+            autoscroll: Default::default(),
             drag_data: 0.0,
             instances: Vec::new(),
             marks: Vec::new(),
@@ -935,6 +955,8 @@ impl<S: 'static> Runtime<S> {
             hits: Vec::new(),
             overlay_hits: Vec::new(),
             glyph_scratch: Vec::new(),
+            text_quads: HashMap::default(),
+            quads_frame: 0,
             deco_scratch: Vec::new(),
             inh_scratch: Vec::new(),
             motion_scratch: Default::default(),

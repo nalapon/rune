@@ -94,14 +94,24 @@ fn whole_frames() -> bool {
 
 type Counts = HashMap<u64, (i32, usize), BuildHasherDefault<Hashed>>;
 
-/// The map's keys are hashes already.
+/// The map's keys are hashes already, mixed once more: FNV's multiply carries only upward, so its
+/// low bits, which pick the bucket, come from the words' low bits alone, and most instances share
+/// those (whole-pixel rects and clips). Unmixed, a scrolled list's thousands of instances fell in
+/// a few long probe chains.
 #[derive(Default)]
 struct Hashed(u64);
 
 impl Hasher for Hashed {
     fn finish(&self) -> u64 { self.0 }
     fn write(&mut self, _: &[u8]) { unreachable!("keys are u64") }
-    fn write_u64(&mut self, v: u64) { self.0 = v; }
+    fn write_u64(&mut self, v: u64) {
+        // MurmurHash3's 64-bit finaliser.
+        let mut h = v ^ (v >> 33);
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        self.0 = h ^ (h >> 33);
+    }
 }
 
 /// FNV-1a over an instance's 32 words: a few ns, against SipHash's ~100.
@@ -139,6 +149,11 @@ fn changed(old: &[Instance], new: &[Instance], size: (u32, u32), s: &mut Scratch
     s.each.clear();
     s.each.extend(counts.values().filter(|(n, _)| *n != 0)
         .filter_map(|(_, at)| bounds(if *at < old.len() { &old[*at] } else { &new[*at - old.len()] }, size)));
+    // A scrolled list changes thousands of instances over most of the window: their union says
+    // so (the plan draws whole above `MOST`) without gathering them into rectangles.
+    if s.each.len() > 256 && let Some(all) = s.each.iter().copied().reduce(join) && area(all) as f32 > MOST * (size.0 * size.1) as f32 {
+        return Area::Rects(vec![all]);
+    }
     s.each.sort_unstable_by_key(|r| (r[1], r[0]));
     let mut rects = Vec::new();
     for r in s.each.iter().copied() { add(&mut rects, r); }

@@ -549,7 +549,7 @@ impl TextSystem {
             // an `Auto` text of the same words would share the layout.
             let base = spec.base();
             let style = (&spec.content, &spec.spans, &spec.cold.blocks);
-            return TextLayout::Single(self.layout_keyed(spec.shape_key(scale), style.0, style.1, style.2, &[], spec.style, scale, max_width, align, spec.wrap_anywhere, Keep::Cached, base));
+            return TextLayout::Single(self.layout_keyed(spec.shape_key(scale), style.0, style.1, style.2, &[], spec.style, scale, max_width, align, spec.wrap_anywhere, false, Keep::Cached, base));
         }
         let forced = spec.paragraphs_flow();
         let shape = spec.shape_key(scale).unwrap_or_else(|| spec.fresh_shape_key(scale));
@@ -653,7 +653,7 @@ impl TextSystem {
                     let near_pills = near(&spec.cold.pills, pills_ordered, a, b, pill_range);
                     let spans: Vec<Span> = spans_in(near_spans, a, b, &isolates).collect();
                     let pills: Vec<PillChip> = pills_in(near_pills, a, b, &isolates).collect();
-                    self.layout_keyed(Some(key), &text, &spans, blocks, &pills, style, scale, max_width, align, spec.wrap_anywhere, Keep::Owned, flow.base())
+                    self.layout_keyed(Some(key), &text, &spans, blocks, &pills, style, scale, max_width, align, spec.wrap_anywhere, false, Keep::Owned, flow.base())
                 }
             };
             // A paragraph kept as it was keeps its measures too: touching 2,000 layouts to read

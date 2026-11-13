@@ -477,6 +477,8 @@ impl<S: 'static> Runtime<S> {
         self.fire_hover_delays();
         self.fire_press_repeat();
         self.fire_edge_scroll();
+        self.fire_autoscroll();
+        self.fire_touch_hold();
         // Marks are paint's (`paint::content`), and this frame paints: a pause that ends or words
         // the checker brought back show without the view running again.
         let (wake, _marked) = crate::spell::pause::tick(&mut self.spell_watch, self.clock);
@@ -575,6 +577,8 @@ impl<S: 'static> Runtime<S> {
             { ran_other |= r && checks == self.live_checks; }
             if r { ran = true; why |= CommitWhy::INPUT; }
         }
+        #[cfg(target_os = "linux")]
+        self.note_primary_selection();
         let mut open_urls = std::mem::take(&mut tx.open_urls);
         self.latch_requests(&mut tx);
         // A handler asked for a menu: the hover it takes ends in this commit, not a frame later.
