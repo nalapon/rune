@@ -258,12 +258,12 @@ impl<S: 'static> Host<S> {
         let half = HalfRounding::of_vendor(crate::gpu::pick::display_vendor().unwrap_or(0));
         crate::marks::mark("cpu.side");
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
             format: wgpu::TextureFormat::Bgra8Unorm,
             width: size.0,
             height: size.1,
             present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: FRAME_LATENCY,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
             color_space: Default::default(),
@@ -280,10 +280,8 @@ impl<S: 'static> Host<S> {
         *self.native_handle.native.window.lock().unwrap() = Arc::downgrade(&window);
         self.native_handle.native.number.store(native_window_number(&window).unwrap_or(0), Ordering::Release);
         let native = {
-            let handle = self.native_handle.clone();
-            let report = Arc::new(move |covered| handle.send(move |slot| WakeEvent::Covered(slot, covered)));
             let mode = SurfaceMode::Cpu { cpu: Cpu { buffer: Buffer::Touching(prefault, capacity), painter, half, shown: Shown::Nothing, show: Some(focus) }, job: GpuJob::Waiting { tries: 0, retry_at: None } };
-            Native { cloak, frame, _occlusion: crate::platform::win32::occlusion::Tracked::new(&window, report), mode, a11y_start, video_layers: Default::default() }
+            Native { cloak, frame, mode, a11y_start, ..Default::default() }
         };
         self.win = Some(Win {
             a11y,
@@ -300,7 +298,6 @@ impl<S: 'static> Host<S> {
             alpha: None,
             timer_frame: TimerFrame::default(),
             presented: None,
-            steady: Steady::Rest,
             covered_draw: CoveredDraw::Current,
             redraw: std::cell::Cell::new(Redraw::Idle),
         });
@@ -472,15 +469,7 @@ impl<S: 'static> Host<S> {
         rt.interaction_presented(submitted, None);
         self.frame_reports.inspect(rt);
         let next_tick = l.next_tick(now).filter(|_| !hidden);
-        let changed = !l.steady.held_frame() || !l.presented.as_ref().is_some_and(|p| p.same(rt, &l.config));
-        let event = if hidden { SteadyEvent::Ends } else { SteadyEvent::Drew { changed, focused: rt.has_window_focus(), now } };
-        l.steady = l.steady.step(event).0;
         self.idle = Presented::settle(&mut l.presented, rt, &l.config, animating || stepping::FrameMove::moving(&self.frame_move), next_tick, !hidden, false);
-        if self.idle && !hidden {
-            let (steady, again) = l.steady.step(SteadyEvent::Rests { now });
-            l.steady = steady;
-            if again { l.request_redraw(); }
-        }
         // Motion's next frame comes at the display's next refresh: a CPU frame presents at once,
         // so nothing else paces it.
         if !hidden && !self.idle {
@@ -548,7 +537,10 @@ impl<S: 'static> Host<S> {
         let size = w.window.inner_size();
         let SurfaceMode::Cpu { mut cpu, .. } = std::mem::replace(&mut w.native.mode, SurfaceMode::Gpu) else { unreachable!() };
         cpu.half = HalfRounding::of_vendor(gpu.adapter.get_info().vendor);
+        w.native.video_layers.hold_premultiplied(vrr_guard(gpu.adapter.get_info().vendor));
         w.native.mode = SurfaceMode::HandingOver { cpu, handover, done: None, readback: None, since: Instant::now(), nudged: None, tries };
+        w.native.slot.reset();
+        w.native.damage.reset();
         // D3D12's idle-priority threads compile the first frame's shaders: on a busy machine they
         // would hold the hand-over frame off.
         crate::platform::win32::unidle_d3d_threads_soon();
@@ -576,6 +568,7 @@ impl<S: 'static> Host<S> {
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         // The app's compositor draws the same instances the CPU painted (the CPU frame drew none of
         // its effect slots, or it would have asked for the GPU).
+        renderer.set_frame_wake(rt.live_wake());
         if let Some(c) = self.comp.as_mut() {
             let size = (l.config.width, l.config.height);
             c.render(&mut Frame { device: &gpu.device, queue: &gpu.queue, encoder: &mut enc, target: &view, format: target_format, size, dt: 0.0, update_ms: 0.0, rt: &mut *rt, ui: &mut *renderer });
@@ -583,8 +576,9 @@ impl<S: 'static> Host<S> {
             renderer.prepare(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, (l.config.width, l.config.height));
             renderer.draw(&mut enc, &view, rt.clear_color());
         }
-        // A copy of the frame, for the drift count once it's the one the window commits to.
-        *readback = l.config.usage.contains(wgpu::TextureUsages::COPY_SRC).then(|| {
+        // A copy of the frame, for the drift count once it's the one the window commits to: only
+        // when it's asked for (`RUNE_CPU_BOOT_DRIFT`), as the count is a diagnostic.
+        *readback = (crate::render::cpu_boot::drift_wanted() && l.config.usage.contains(wgpu::TextureUsages::COPY_SRC)).then(|| {
             let (width, height) = (l.config.width, l.config.height);
             let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("rune hand-over readback"), size: u64::from(row) * u64::from(height), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
@@ -594,6 +588,7 @@ impl<S: 'static> Host<S> {
         });
         renderer.submit(&gpu.queue, enc);
         gpu.queue.present(frame);
+        l.native.slot.presented();
         let flag = Arc::new(AtomicBool::new(false));
         let set = flag.clone();
         gpu.queue.on_submitted_work_done(move || set.store(true, Ordering::Release));
@@ -633,8 +628,18 @@ impl<S: 'static> Host<S> {
                 }
                 // What DWM shows is in the window's own surface now, not in the buffer: it goes on a
                 // worker, after counting how many of its pixels the GPU's same frame drew otherwise.
+                // A frame only the GPU draws (Slug's text, a native surface) never showed a CPU
+                // frame: its buffer holds nothing to count against.
+                let shown = matches!(cpu.shown, Shown::Copied(_));
                 if let Some(dib) = cpu.into_dib() {
-                    match readback { Some(r) => count_drift(gpu.clone(), r, dib), None => free_later(dib) }
+                    match readback {
+                        Some(r) if shown => count_drift(gpu.clone(), r, dib),
+                        Some(_) => {
+                            eprintln!("rune: cpu boot drift: none to count, the CPU showed no frame (the first needed the GPU)");
+                            free_later(dib);
+                        }
+                        None => free_later(dib),
+                    }
                 }
                 w.native.mode = SurfaceMode::Handed { handover };
                 w.presented = None;
@@ -765,3 +770,14 @@ fn lower_priority() {
     // SAFETY: this thread's pseudo-handle.
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
+
+
+/// Whether the window's swap chain composites premultiplied for good, so the display's refresh
+/// rate doesn't follow its presents. With G-SYNC in windowed mode (NVIDIA's, off by default) the
+/// display refreshes when the focused window presents an opaque flip-model or DirectComposition
+/// swap chain, so lone presents (a hover) swing the rate, and many OLED panels' brightness with it
+/// (hex#689). A premultiplied DirectComposition swap chain keeps G-SYNC off (measured on that
+/// hardware, as reported there). It costs DWM a blend of the regions the window
+/// presents, and nothing while it rests. A fixed-rate display (blade's Iris panel) needs nothing:
+/// its refresh doesn't depend on who presents.
+fn vrr_guard(vendor: u32) -> bool { vendor == 0x10DE }

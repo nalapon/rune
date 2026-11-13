@@ -2423,6 +2423,27 @@ cargo build --release -p settings
 target/release/settings                       # the window
 ```
 
+### Depending on Rune
+
+An app pins a `dev` rev and patches the same four crates Rune does, from the same rev. A
+dependency's `[patch]` doesn't reach the workspace that depends on it, and without these the app
+builds against stock crates: winit's patch carries macOS input-method and Windows window-creation
+fixes, parley_engine's carries bidi and shaping fixes.
+
+```toml
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+```
+
+The list is the `[patch.crates-io]` table in Rune's root `Cargo.toml`; when a bump adds an entry
+there, add it here too.
+
 ### Linux
 
 Linux builds link `libxkbcommon` (layer-shell and display-targeted overlays) and
@@ -2446,6 +2467,11 @@ Without `libxkbcommon-x11-0` every windowed example panics at startup with
 it, and the app then runs under Xvfb. Headless `--snap` runs don't need a display or the XKB library.
 
 ## Agent tooling (headless, no window, same renderer, fixed virtual clock)
+
+Debug builds always take these arguments. A release build takes them with Rune's `tooling`
+feature (`rune = { ..., features = ["tooling"] }`; Rune's examples have it); without it the app
+links only its window, and a headless argument makes `run` fail saying so. `--native --trace` is
+the window's own and works either way.
 
 ```sh
 S=target/release/settings
@@ -2515,6 +2541,9 @@ $L --desktop examples/launcher/backdrop.png --script examples/launcher/scripts/d
   the app's root background, falling back to `--theme` when the background is transparent.
   `--pointer` adds a ripple at each press. A separate runtime draws both after the app, so they
   appear in `--video`, `--out`, `--snap` and strips but never in `--tree` or `--trace`.
+  That runtime is a second `Runtime` in the exe (about 1.46 MB), so a release build draws them only
+  with the `keys-overlay` feature (which includes `tooling`; Rune's examples have it); debug builds
+  always do.
 - **Desktop recordings**: `--desktop BACKDROP.png` renders all of a multi-window app's visible
   windows into one frame, so a launcher, its panel and the app's other windows record together
   the way a screen recording would show them. Each window renders with its own state into its

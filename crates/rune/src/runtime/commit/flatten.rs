@@ -230,6 +230,8 @@ fn prepare_text(
     }
     if let Some(t) = text
         && let dir = crate::el::step_text_dir(t.dir, crate::el::TextDirEvent::Flatten(flow))
+        // A field Ctrl+Shift set reads that way, every line of it.
+        && let dir = input.and_then(|i| i.edit.forced_dir()).map_or(dir, crate::el::TextDir::Fixed)
         && t.dir != dir
     {
         t.dir = dir;
@@ -438,7 +440,8 @@ fn flatten_owned(
         return (slot, false);
     }
     let record_built = parent_sx.is_none().then(|| {
-        let built = el.memo_built().filter(|b| b.reusable && memo_reuse::same_root_el(&el, b))?;
+        let built = el.memo_built().filter(|b| b.reusable && memo_reuse::same_root_el(&el, b, false))
+            .or_else(|| el.cold.expanded_memo.as_ref().filter(|b| b.reusable && memo_reuse::same_root_el(&el, b, true)))?;
         let (inherited, hover_within) = memo_reuse::inherited_for(parent, nodes, motion, in_row, scale, memo_ctx.foreground);
         Some((built.id, inherited, hover_within))
     }).flatten();
@@ -467,6 +470,7 @@ fn flatten_owned(
     let directed = el.flags.dir().is_some() || parent.is_some_and(|p| nodes[p].directed);
     let pin = crate::el::Pin::of(&el);
     let El { handlers, key, mut style, mut vis, vis_flags, mut text, children, memo, mut cold, scale: static_scale, .. } = el;
+    let option_as_alt = cold.option_as_alt;
     let focus = cold.focus.clone();
     // Only a text field's element has to own its cold fields here; a memo placeholder shares them.
     let mut input = if cold.input.is_some() { cold.get_mut_if_some().and_then(|c| c.input.take()) } else { None };
@@ -584,6 +588,7 @@ fn flatten_owned(
         selection_group: flags.has(ElFlags::SELECTION_GROUP),
         window_drag: flags.window_drag(),
         ime_cursor: flags.has(ElFlags::IME_CURSOR),
+        ime_option_as_alt: option_as_alt,
         moved_stub: false,
     });
     let child_in_row = match in_row {
@@ -642,7 +647,8 @@ fn flatten_ref(
         return (slot, false);
     }
     let record_built = parent_sx.is_none().then(|| {
-        let built = el.memo_built().filter(|b| b.reusable && memo_reuse::same_root_el(el, b))?;
+        let built = el.memo_built().filter(|b| b.reusable && memo_reuse::same_root_el(el, b, false))
+            .or_else(|| el.cold.expanded_memo.as_ref().filter(|b| b.reusable && memo_reuse::same_root_el(el, b, true)))?;
         let (inherited, hover_within) = memo_reuse::inherited_for(parent, nodes, motion, in_row, scale, memo_ctx.foreground);
         Some((built.id, inherited, hover_within))
     }).flatten();
@@ -786,6 +792,7 @@ fn flatten_ref(
         selection_group: flags.has(ElFlags::SELECTION_GROUP),
         window_drag: flags.window_drag(),
         ime_cursor: flags.has(ElFlags::IME_CURSOR),
+        ime_option_as_alt: el.cold.option_as_alt,
         moved_stub: false,
     });
     let child_in_row = match in_row {

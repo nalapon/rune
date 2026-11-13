@@ -27,7 +27,9 @@ impl<S: 'static> AnyHost for Host<S> {
         // running link, a timer due sooner than a frame waits a frame (`timer_deadline`).
         let now = Instant::now();
         let win = self.win.as_ref();
-        let runtime = timer_deadline(&self.rt).filter(|_| !win.is_some_and(Win::paced));
+        // A frame waiting for room in the swap chain comes when there is (`slot`): its timers
+        // would turn the loop at once until then.
+        let runtime = timer_deadline(&self.rt).filter(|_| !win.is_some_and(|w| w.paced() || w.waits_for_slot()));
         // A due timer whose frame is still on its way takes the frame's bound instead
         // (`TimerFrame`), so the loop sleeps rather than waking at once for a frame that can't
         // come.
@@ -49,8 +51,10 @@ impl<S: 'static> AnyHost for Host<S> {
             .chain(win.and_then(Win::cloak_deadline))
             .chain(win.and_then(|w| w.backoff.deadline()))
             .chain(win.filter(|_| shown.is_none()).and_then(|w| w.hidden_pace.deadline()))
+            .chain(look_deadline(win))
             .chain(self.files.pointer.as_ref().filter(|_| shown.is_some()).map(|_| now + DROP_SAMPLE))
             .chain(shown.and_then(|w| w.cursor.reassert_at(now)))
+            .chain(self.rest.deadline())
             .min()
     }
 
@@ -202,11 +206,17 @@ impl<S: 'static> Host<S> {
             self.life.cover(Cover::Surface, false);
             if launcher || self.life.shown() { w.request_redraw(); }
         }
+        self.rest_step(RestEvent::Woke { now: Instant::now() });
         if let Some(w) = &mut self.win && !self.life.shown() && w.hidden_pace.take_due(Instant::now()) {
+            w.request_redraw();
+        }
+        // A covered window with motion on screen looks again whether it's still covered (`look`).
+        if let Some(w) = &self.win && self.life.covered() && look_deadline(Some(w)).is_some_and(|at| at <= Instant::now()) {
             w.request_redraw();
         }
         if matches!(cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
             && timer_deadline(&self.rt).is_some_and(|deadline| deadline <= Instant::now())
+            && !self.win.as_ref().is_some_and(Win::waits_for_slot)
         {
             let hidden = self.shown_win().is_none();
             if hidden && !(launcher && self.hidden_launcher_renders()) {
@@ -304,4 +314,12 @@ impl<S: 'static> Host<S> {
         #[cfg(feature = "frame-profile")]
         if let Some(start) = logged { crate::frame::live_log::input(start); }
     }
+}
+
+/// When a covered window looks again whether it's still covered (`look`).
+fn look_deadline(win: Option<&Win>) -> Option<Instant> {
+    #[cfg(target_os = "windows")]
+    return win.and_then(|w| w.native.look.deadline());
+    #[cfg(not(target_os = "windows"))]
+    { let _ = win; None }
 }
