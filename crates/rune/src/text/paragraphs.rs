@@ -1,11 +1,15 @@
-//! A text field laid out one paragraph at a time ([`El::dir_by_paragraph`](crate::El::dir_by_paragraph)):
-//! each line a newline ends gets its own layout in the direction of its own first strong
-//! character, as CSS's `unicode-bidi: plaintext` lays out a `contenteditable`. Parley gives a
-//! layout one base direction, so an Arabic line under an English one needs a layout of its own.
-//! The paragraphs stack in one field: one editor, one caret, one selection. An edit shapes only
-//! the paragraphs it changed; the others keep their layouts from the field's last one.
+//! A wrapped multi-line text field laid out one paragraph at a time: each line a newline ends
+//! gets its own layout. The paragraphs stack in one field: one editor, one caret, one
+//! selection. An edit shapes only the paragraphs it changed; the others keep their layouts from
+//! the field's last one, so typing in a long note costs a line, not the note.
 //!
-//! A mention pill's label is shaped between U+2068 FIRST STRONG ISOLATE and U+2069 POP
+//! The lines read in the field's one direction, as its single layout would: its own, or (`Auto`)
+//! its whole text's first strong one. Under [`El::dir_by_paragraph`](crate::El::dir_by_paragraph)
+//! each line instead reads in the direction of its own first strong character, as CSS's
+//! `unicode-bidi: plaintext` lays out a `contenteditable`: Parley gives a layout one base
+//! direction, so an Arabic line under an English one needs a layout of its own.
+//!
+//! There, a mention pill's label is shaped between U+2068 FIRST STRONG ISOLATE and U+2069 POP
 //! DIRECTIONAL ISOLATE, as a `dir="auto"` span with `unicode-bidi: isolate` is: `@src/app.ts`
 //! stays left to right on an Arabic line, and the line's direction skips it. Positions outside
 //! this module are the field's content bytes; [`Piece::shaped`] and [`Piece::content`] map them
@@ -16,7 +20,7 @@ use std::hash::{Hash, Hasher};
 
 use super::*;
 use crate::edit::Block;
-use crate::el::{Direction, Flow, TextSpec};
+use crate::el::{Direction, Flow, TextDir, TextSpec};
 
 /// The bytes U+2068 and U+2069 each take.
 const ISOLATE: usize = 3;
@@ -193,15 +197,42 @@ fn spans_in<'s>(spans: &'s [Span], a: usize, b: usize, isolates: &'s [(u32, u32)
     })
 }
 
-/// `pills` inside content bytes `a..b`, each its label's shaped bytes.
+/// `pills` inside content bytes `a..b`, each its label's shaped bytes: inside its isolate when
+/// the paragraph isolates its pills (`isolates` lists them all), else where it sits.
 fn pills_in<'s>(pills: &'s [PillChip], a: usize, b: usize, isolates: &'s [(u32, u32)]) -> impl Iterator<Item = PillChip> + 's {
+    let iso = if isolates.is_empty() { 0 } else { ISOLATE };
     pills.iter().filter(move |p| inside(p, a, b)).map(move |p| PillChip {
-        start: (shaped(isolates, p.start as usize - a) + ISOLATE) as u32,
-        end: (shaped(isolates, p.end as usize - a) - ISOLATE) as u32,
+        start: (shaped(isolates, p.start as usize - a) + iso) as u32,
+        end: (shaped(isolates, p.end as usize - a) - iso) as u32,
         ..p.clone()
     })
 }
 
+/// The part of `items` that can meet content bytes `a..b`, found by halving when they are in
+/// order and don't overlap (as `flatten_spans` leaves spans); all of them otherwise.
+fn near<T>(items: &[T], ordered: bool, a: usize, b: usize, range: impl Fn(&T) -> (u32, u32)) -> &[T] {
+    if !ordered { return items; }
+    let lo = items.partition_point(|t| (range(t).1 as usize) <= a);
+    let hi = items.partition_point(|t| (range(t).0 as usize) < b).max(lo);
+    &items[lo..hi]
+}
+
+fn in_order<T>(items: &[T], range: impl Fn(&T) -> (u32, u32)) -> bool {
+    items.windows(2).all(|w| range(&w[0]).1 <= range(&w[1]).0)
+}
+
+/// Whether `content`'s lines, laid out one at a time in one direction, draw as one layout of
+/// it does: no CR (a CRLF is one break there), no bidi controls (an isolate or embedding runs
+/// on across a newline there), and no kana, Hangul, Bopomofo or Han (one layout's language,
+/// `language::of_text`, comes from all of its text). One pass, ASCII at once.
+fn lines_alike(content: &str) -> bool {
+    if content.is_ascii() { return !content.as_bytes().contains(&b'\r'); }
+    !content.chars().any(|ch| matches!(ch as u32,
+        0x0D | 0x202A..=0x202E | 0x2066..=0x2069
+        | 0x1100..=0x11FF | 0x3041..=0x30FF | 0x3100..=0x312F | 0x3130..=0x318F | 0x31A0..=0x31BF | 0x31F0..=0x31FF
+        | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xF900..=0xFAFF | 0xFF66..=0xFF9F
+        | 0x20000..=0x3FFFF))
+}
 fn inside(p: &PillChip, a: usize, b: usize) -> bool {
     a <= p.start as usize && p.end as usize <= b && p.start < p.end
 }
@@ -488,7 +519,7 @@ impl TextSystem {
         align: Alignment,
         prev: Option<&TextLayout>,
     ) -> TextLayout {
-        if !spec.by_paragraph(input) {
+        if !spec.by_paragraph(input) || !(spec.per_paragraph_dir() || lines_alike(&spec.content)) {
             return TextLayout::Single(self.layout_for_spec(spec, scale, max_width, align));
         }
         // A language chosen since drops what was shaped in the last one, before the cache or
@@ -496,16 +527,17 @@ impl TextSystem {
         self.follow_language();
         // One paragraph and no pills, as most drafts are: one layout in its own direction.
         if spec.cold.pills.is_empty() && !spec.content.contains('\n') {
-            let base = flow_of(&spec.content, &[]).unwrap_or(spec.plaintext_flow()).base();
-            // The shape key is already in this direction (`TextSpec::base` reads it the same
-            // way); turning it again would cancel it, and an `Auto` text would share the layout.
-            debug_assert_eq!(base, spec.base());
+            // Its shape key is already in this direction: turning it again would cancel it, and
+            // an `Auto` text of the same words would share the layout.
+            let base = spec.base();
             let style = (&spec.content, &spec.spans, &spec.cold.blocks);
             return TextLayout::Single(self.layout_keyed(spec.shape_key(scale), style.0, style.1, style.2, &[], spec.style, scale, max_width, align, spec.wrap_anywhere, Keep::Cached, base));
         }
         let shape = spec.shape_key(scale).unwrap_or_else(|| spec.fresh_shape_key(scale));
         // Lines with no strong character take the element's flow, so it keys the whole too.
         let whole = if spec.plaintext_flow() == Flow::Rtl { shape ^ 0x3c6e_f372_fe94_f82b } else { shape };
+        // Lines in their own directions with isolated pills lay out apart from lines in one.
+        let whole = if spec.per_paragraph_dir() { whole } else { whole ^ 0x9e37_79b9_7f4a_7c15 };
         let blocks = &spec.cold.blocks;
         let indented = blocks.iter().any(|&b| b != Block::Paragraph).then_some(blocks.as_slice());
         let key = hash::break_key(whole ^ PARAGRAPHS, max_width, align, indented);
@@ -548,20 +580,38 @@ impl TextSystem {
         };
         let mut found: Vec<(usize, usize, Flow, u64, Box<[(u32, u32)]>)> = Vec::new();
         let mut start = 0;
+        let per_line = spec.per_paragraph_dir();
+        // Without `dir_by_paragraph`, every line reads as the field's one layout would.
+        let one = match spec.dir {
+            TextDir::Plaintext(_) => None,
+            TextDir::Fixed(flow) => Some(flow),
+            // `lines_alike` leaves no isolate open across a line for Parley to carry on.
+            TextDir::Auto => Some(if Direction::of_all(content) == Some(Direction::Rtl) { Flow::Rtl } else { Flow::Ltr }),
+        };
+        // Each paragraph looks only at the spans and pills that can meet it.
+        let (spans, pills) = (spec.spans.as_slice(), spec.cold.pills.as_slice());
+        let span_range = |s: &Span| (s.start, s.end);
+        let pill_range = |p: &PillChip| (p.start, p.end);
+        let (spans_ordered, pills_ordered) = (in_order(spans, span_range), in_order(pills, pill_range));
         // A paragraph with no strong character reads the way the one before it does.
         let mut last = spec.plaintext_flow();
         for (k, words) in content.split('\n').enumerate() {
             let (a, b) = (start, start + words.len());
             start = b + 1;
-            let isolates: Box<[(u32, u32)]> = spec.cold.pills.iter().filter(|p| inside(p, a, b)).map(|p| (p.start - a as u32, p.end - a as u32)).collect();
-            let flow = flow_of(words, &isolates).unwrap_or(last);
+            let (spans, pills) = (near(spans, spans_ordered, a, b, span_range), near(pills, pills_ordered, a, b, pill_range));
+            let isolates: Box<[(u32, u32)]> = if per_line {
+                pills.iter().filter(|p| inside(p, a, b)).map(|p| (p.start - a as u32, p.end - a as u32)).collect()
+            } else {
+                Box::default()
+            };
+            let flow = one.unwrap_or_else(|| flow_of(words, &isolates).unwrap_or(last));
             last = flow;
             let mut h = hash::KeyHasher::default();
             (words, style_key, flow == Flow::Rtl, spec.cold.blocks.get(k).copied().unwrap_or(Block::Paragraph)).hash(&mut h);
-            for s in spans_in(&spec.spans, a, b, &isolates) {
+            for s in spans_in(spans, a, b, &isolates) {
                 (s.start, s.end, s.mono, s.weight.map(f32::to_bits), s.size.map(f32::to_bits), s.italic).hash(&mut h);
             }
-            for p in pills_in(&spec.cold.pills, a, b, &isolates) {
+            for p in pills_in(pills, a, b, &isolates) {
                 (p.start, p.end, p.icon.is_some(), p.bare.as_ref().map(|b| (b.size.to_bits(), b.gap.to_bits()))).hash(&mut h);
             }
             found.push((a, b, flow, h.finish(), isolates));
@@ -596,8 +646,10 @@ impl TextSystem {
                     fresh += b - a;
                     let words = &content[a..b];
                     let text: Cow<str> = if isolates.is_empty() { Cow::Borrowed(words) } else { Cow::Owned(with_isolates(words, &isolates)) };
-                    let spans: Vec<Span> = spans_in(&spec.spans, a, b, &isolates).collect();
-                    let pills: Vec<PillChip> = pills_in(&spec.cold.pills, a, b, &isolates).collect();
+                    let near_spans = near(&spec.spans, spans_ordered, a, b, span_range);
+                    let near_pills = near(&spec.cold.pills, pills_ordered, a, b, pill_range);
+                    let spans: Vec<Span> = spans_in(near_spans, a, b, &isolates).collect();
+                    let pills: Vec<PillChip> = pills_in(near_pills, a, b, &isolates).collect();
                     self.layout_keyed(Some(key), &text, &spans, blocks, &pills, style, scale, max_width, align, spec.wrap_anywhere, Keep::Owned, flow.base())
                 }
             };

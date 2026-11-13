@@ -1,5 +1,13 @@
+use std::time::Duration;
+
 use crate::compose::Compositor;
 use crate::runtime::Runtime;
+use crate::time::Instant;
+
+/// How long after its present a frame has left the drawable queue, barring a stalled GPU: three
+/// drawables at 30 Hz. Input before then builds after acquiring, so a drawable wait doesn't age
+/// it; after, a stalled GPU's wait can age it, as it can a timer frame's.
+const DRAINED: Duration = Duration::from_millis(100);
 
 /// Whether a compositor draws motion of its own (`Compositor::animating`): its window never
 /// rests, and a due timer draws.
@@ -12,8 +20,9 @@ pub(super) fn composing<S: 'static>(comp: Option<&dyn Compositor<S>>) -> bool {
 pub(super) fn composed<S: 'static>(comp: Option<&dyn Compositor<S>>) -> bool {
     comp.is_some_and(|c| c.draws_own())
 }
-/// What an idle window's last frame drew. A timer that wakes the window builds a frame before
-/// taking a drawable; when it would draw these same pixels, nothing is acquired or presented.
+/// What an idle window's last frame drew. A frame asked for while it rests (a timer's, or
+/// input's) is built before taking a drawable; when it would draw these same pixels, nothing is
+/// acquired or presented.
 /// A compositor's frame lets the window rest but never counts as the same: it may draw
 /// differently from the same instances.
 pub(crate) struct Presented {
@@ -25,6 +34,8 @@ pub(crate) struct Presented {
     scale: f32,
     transparent: bool,
     composed: bool,
+    /// When the frame it holds was presented.
+    at: Instant,
 }
 
 impl Presented {
@@ -44,13 +55,19 @@ impl Presented {
     pub(crate) fn record<S: 'static>(this: &mut Option<Self>, rt: &Runtime<S>, config: &wgpu::SurfaceConfiguration, composed: bool) {
         let (clear, size, srgb, scale, transparent) = (rt.clear_color(), (config.width, config.height), rt.srgb_blend(), rt.env.scale, rt.transparent);
         let p = this.get_or_insert_with(|| Self {
-            instances: Vec::new(), clear, size, format: config.format, srgb, scale, transparent, composed,
+            instances: Vec::new(), clear, size, format: config.format, srgb, scale, transparent, composed, at: Instant::now(),
         });
+        p.at = Instant::now();
         if composed { p.instances.clear() } else { p.instances.clone_from(&rt.instances) }
         (p.clear, p.size, p.format, p.srgb, p.scale, p.transparent, p.composed) = (clear, size, config.format, srgb, scale, transparent, composed);
     }
 
-    /// Whether a timer frame `rt` built before taking a drawable can go without one: nothing
+    /// Whether its frame has surely left the drawable queue by `now` (`DRAINED`).
+    pub(super) fn drained(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) >= DRAINED
+    }
+
+    /// Whether a frame `rt` built before taking a drawable can go without one: nothing
     /// moves or waits, no timer wants the display link's next tick (`next_tick`), and it draws
     /// what this frame did.
     pub(crate) fn unchanged<S: 'static>(&self, rt: &Runtime<S>, config: &wgpu::SurfaceConfiguration, animating: bool,

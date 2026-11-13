@@ -123,4 +123,7 @@ impl Steady {
 
     /// The frame now drawing was asked for by the run alone.
     pub(super) fn held_frame(self) -> bool { matches!(self, Steady::HeldFrame { .. }) }
+
+    /// No run is going: the window's frames may stop when they stop changing.
+    pub(super) fn rests(self) -> bool { matches!(self, Steady::Rest) }
 }

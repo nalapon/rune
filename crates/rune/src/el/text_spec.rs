@@ -272,12 +272,32 @@ impl TextSpec {
         }
     }
 
-    /// Whether it lays out one paragraph at a time, each in its own direction
-    /// ([`crate::text::ParagraphLayout`]): a wrapped, uncut field's by-paragraph text. Others
-    /// stay one layout (a static text splits into one text per paragraph instead).
+    /// Whether it lays out one paragraph at a time ([`crate::text::ParagraphLayout`]): a
+    /// wrapped, uncut field's text, so an edit shapes only the lines it changed. Others stay one
+    /// layout (a static by-paragraph text splits into one text per paragraph instead).
+    ///
+    /// A field that isn't `El::dir_by_paragraph` does only when its lines draw as its one layout
+    /// would: no links, highlights or rings (they're placed on one layout), start-aligned plain
+    /// paragraphs (a blank line's caret sits at the start), no span that sizes text (one over a
+    /// newline sets its empty line's height) and no strike over a newline (it takes the
+    /// newline's width). `TextSystem::layout_text` checks its content too.
     pub(crate) fn by_paragraph(&self, input: bool) -> bool {
-        matches!(self.dir, TextDir::Plaintext(_)) && input && self.wrap && !self.redacted && !self.truncate && !self.truncate_fade
+        input && self.wrap && !self.redacted && !self.truncate && !self.truncate_fade
             && self.max_lines == 0 && self.cold.live.is_none() && self.cold.advance_in.is_none()
+            && (self.per_paragraph_dir() || (
+                self.cold.links.is_empty() && self.cold.highlights.is_empty() && self.cold.rings.is_empty()
+                    && self.align == Align::Start
+                    && self.cold.blocks.iter().all(|&b| b == crate::edit::Block::Paragraph)
+                    && self.spans.iter().all(|s| s.size.is_none())
+                    && self.cold.strikes.iter().all(|&(a, b, _)| self.content.get(a as usize..b as usize).is_some_and(|s| !s.contains('\n')))
+            ))
+    }
+
+    /// Whether each of its paragraphs reads in its own direction, its mention pills isolated
+    /// (`El::dir_by_paragraph`, CSS's `unicode-bidi: plaintext`). Otherwise a by-paragraph
+    /// field's lines read as its one layout would.
+    pub(crate) fn per_paragraph_dir(&self) -> bool {
+        matches!(self.dir, TextDir::Plaintext(_))
     }
 
     /// Zeroizes the shown string and shows `content` instead.

@@ -189,13 +189,21 @@ impl<S: 'static> Host<S> {
         #[cfg(target_os = "macos")]
         { self.rt.native_materials = l.native.materials.native(); }
         if self.frame_reports.wanted() { self.frame_reports.set_refresh(display_hz(l)); }
-        // Only a timer woke the resting window: build the frame first, and take no drawable
-        // when it draws what's on screen.
+        // A frame asked for while the window rests, by a timer or by input that may change
+        // nothing (a pointer moving over what doesn't hover): build it first, and take no
+        // drawable when it draws what's on screen. At rest the last frame is long presented and
+        // the drawable free, so building first ages no input.
         #[cfg(feature = "frame-profile")]
         let fp_entry = crate::frame::live_log::on().then(crate::frame::live_log::Stamp::now);
-        let quiet = l.timer_frame.take_quiet() && !hidden && !live_resize && l.presented.is_some() && !composed(self.comp.as_deref())
+        // Input waits until the last frame has surely left the drawable queue.
+        let timer = l.timer_frame.take_quiet();
+        let quiet = !hidden && !live_resize && !composed(self.comp.as_deref())
+            && l.presented.as_ref().is_some_and(|p| timer || p.drained(Instant::now()))
             && self.trace.is_none() && self.args.trace.is_none() && self.rt.live_visible()
             && self.rt.window_frame.is_none() && !FrameMove::moving(&self.frame_move);
+        // A steady run's frames present even when unchanged: that is the run.
+        #[cfg(target_os = "windows")]
+        let quiet = quiet && l.steady.rests();
         #[cfg(target_os = "macos")]
         let quiet = quiet && shown.is_none() && !l.native.materials.native();
         let built = if quiet {

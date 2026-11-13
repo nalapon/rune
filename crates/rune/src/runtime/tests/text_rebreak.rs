@@ -160,3 +160,18 @@ fn a_new_language_shapes_every_line_of_a_by_paragraph_field_again() {
     rt.frame(1.0 / 120.0);
     assert!(rt.text.shaped >= shaped + 3, "{} of 3 lines shaped again", rt.text.shaped - shaped);
 }
+
+fn plain_field(edit: &crate::TextEdit, _: &mut Cx<crate::TextEdit>) -> El {
+    col().w_full().child(crate::text_input(edit, crate::TextStyle::new(15.0, 400.0)).w_full().key("field"))
+}
+
+/// A field with no direction of its own reads every line as one layout of its whole text does:
+/// from its first strong character, though the line the text starts on has none.
+#[test]
+fn an_auto_field_reads_every_line_from_its_first_strong_character() {
+    let mut rt = Runtime::new(crate::TextEdit::new("123\nمرحبا\nabc"), plain_field, (400.0, 300.0), Env::new(true, 2.0));
+    rt.frame(0.0);
+    let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some("field")).unwrap();
+    let rtl: Vec<bool> = n.text_layout.as_ref().unwrap().view().pieces().map(|p| p.layout.is_rtl()).collect();
+    assert_eq!(rtl, [true, true, true]);
+}

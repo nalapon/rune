@@ -272,7 +272,7 @@ impl<S: 'static> Runtime<S> {
                     let wrap = (!inp.single_line).then(|| (x1 - x0 - pl_indent).max(1.0) / tk.max(1e-4));
                     // A by-paragraph field's placeholder is a `dir="auto"` text of its own, as
                     // Desktop's composer draws it: in its own direction, its field's padding with it.
-                    let own = spec.by_paragraph(true);
+                    let own = spec.by_paragraph(true) && spec.per_paragraph_dir();
                     let options = crate::text::RichLayoutOptions::new().flow(match spec.dir {
                         crate::el::TextDir::Fixed(f) if !own => Some(f),
                         _ => None,

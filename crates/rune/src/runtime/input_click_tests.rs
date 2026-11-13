@@ -103,17 +103,19 @@ fn rect_of(rt: &Runtime<Form>, key: &str) -> [f32; 4] {
 /// Window point `(x, y)` at `frac` (`0.0..1.0`) across the glyph cluster at `byte` in `key`.
 fn point_in_cluster(rt: &Runtime<Form>, key: &str, byte: usize, frac: f32) -> (f32, f32) {
     let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some(key)).unwrap();
-    let l = n.text_layout.as_ref().and_then(crate::text::TextLayout::single).unwrap();
+    // A multi-line field lays out a paragraph at a time: the one holding `byte`, from its top.
+    let piece = n.text_layout.as_ref().unwrap().view().piece_at(byte);
+    let (l, at) = (piece.layout, piece.shaped(byte));
     let s = rt.env.scale;
-    let cl = parley::Cluster::from_byte_index(l, byte).unwrap();
+    let cl = parley::Cluster::from_byte_index(l, at).unwrap();
     let x0 = cl.visual_offset().unwrap();
     let adv = cl.advance();
-    let cur = Cursor::from_byte_index(l, byte, Affinity::Downstream);
+    let cur = Cursor::from_byte_index(l, at, Affinity::Downstream);
     let bb = crate::text::cursor_geometry(&cur, l, 1.0);
     let r = rect_of(rt, key);
     (
         r[0] + n.inset[0] + (x0 + adv * frac) / s,
-        r[1] + n.inset[1] + ((bb.y0 + bb.y1) * 0.5) as f32 / s,
+        r[1] + n.inset[1] + (piece.y + ((bb.y0 + bb.y1) * 0.5) as f32) / s,
     )
 }
 

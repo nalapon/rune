@@ -40,6 +40,12 @@ impl Direction {
         first_strong_char(text, false)
     }
 
+    /// The first strong direction across all of `text`'s paragraphs, as one `Auto` layout of
+    /// it reads it, or `None` when it has none.
+    pub(crate) fn of_all(text: &str) -> Option<Direction> {
+        first_strong_char(text, true)
+    }
+
     /// Whether this is [`Direction::Rtl`].
     pub fn is_rtl(self) -> bool {
         self == Direction::Rtl
