@@ -337,6 +337,7 @@ pub(crate) mod web_export;
 #[path = "runtime/commit/text_layout.rs"]
 mod text_layout;
 use text_layout::*;
+pub(crate) use text_layout::text_width;
 #[path = "runtime/commit/flatten.rs"]
 mod flatten;
 use flatten::*;
@@ -533,10 +534,13 @@ pub struct Runtime<S: 'static> {
     hits: Vec<(NodeId, [f32; 4])>,
     overlay_hits: Vec<[f32; 4]>,
     glyph_scratch: Vec<GlyphQuad>,
-    /// Each still text's quads as it drew them, by node and layout, and the paint they were last
-    /// used in (`paint_content`): a frame that draws it the same copies them.
-    text_quads: HashMap<(NodeId, usize), (Rc<parley::Layout<crate::text::Ink>>, crate::el::grid::DrawnRow, u64)>,
+    /// Each still text's quads as it drew them, by node and layout id, and the paint they were
+    /// last used in (`paint_content`): a frame that draws it the same copies them.
+    text_quads: HashMap<(NodeId, crate::text::LayoutId), (crate::el::grid::DrawnRow, u64)>,
     quads_frame: u64,
+    /// Still texts that copied their quads, for tests.
+    #[cfg(test)]
+    quads_copied: u64,
     deco_scratch: Vec<PaintedDeco>,
     inh_scratch: Vec<Inh>,
     /// `motion_elements`' per-node scratch, kept so a frame doesn't allocate.
@@ -957,6 +961,8 @@ impl<S: 'static> Runtime<S> {
             glyph_scratch: Vec::new(),
             text_quads: HashMap::default(),
             quads_frame: 0,
+            #[cfg(test)]
+            quads_copied: 0,
             deco_scratch: Vec::new(),
             inh_scratch: Vec::new(),
             motion_scratch: Default::default(),

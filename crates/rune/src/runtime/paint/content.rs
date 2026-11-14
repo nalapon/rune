@@ -15,6 +15,9 @@ pub(super) struct LeafBox {
     pub clip: [f32; 4],
     pub fade: [f32; 4],
     pub group: f32,
+    /// The nearest `El::press_color` (here or above) and how far a press on it is held.
+    pub pressed: f32,
+    pub press_to: Option<Color>,
     pub loop_value: Option<f32>,
     pub cover: Option<(f32, [f32; 2])>,
     pub scale_motion: ScaleMotion,
@@ -59,6 +62,8 @@ impl<S: 'static> Runtime<S> {
             clip,
             fade,
             group,
+            pressed,
+            press_to,
             loop_value,
             cover,
             scale_motion,
@@ -80,7 +85,7 @@ impl<S: 'static> Runtime<S> {
             self.paint_grid(i, &g, r, r_exact, clip, fade, o, glyph_count);
         }
         let n = &self.nodes[i];
-        let text_tint = |c: Color| paint_tracks::group_tint(n, c, group);
+        let text_tint = |c: Color| paint_tracks::press_tint(paint_tracks::group_tint(n, c, group), press_to, pressed);
         if let Some(shape) = &n.vis.shape {
             // At rest a shape draws from its exact box's origin rounded to the device grid, at its
             // exact scale, as Chromium draws a canvas or an inline SVG: what it holds keeps its
@@ -232,7 +237,7 @@ impl<S: 'static> Runtime<S> {
             let direct = self.text.emit() == crate::text::outline::Emit::Outline;
             let ins = n.inset.map(|v| v * zk * s);
             let (x0, x1) = (zr[0] + ins[0], zr[2] - ins[2]);
-            let mut origin = [text_x(spec, x0, x1, (flow.full_width() * tk).ceil(), flow.flow()), zr[1] + ins[1]];
+            let mut origin = [text_x(spec, x0, x1, text_width(flow.full_width() * tk), flow.flow()), zr[1] + ins[1]];
             // A gliding box's glyphs and decorations lay out from its nearest whole pixel and move the rest.
             // Within a 64th of a pixel they don't move, but still lay out from that pixel, as at rest.
             let (glide, off) = if gliding && cover.is_none() && scale_motion == ScaleMotion::Still {
@@ -296,14 +301,14 @@ impl<S: 'static> Runtime<S> {
                         crate::el::TextDir::Fixed(f) if !own => Some(f),
                         _ => None,
                     });
-                    let pl = self.text.layout_rich_with(&inp.placeholder, &[], spec.style, s, wrap, options);
+                    let pl = self.text.layout_rich_with(&inp.placeholder, &[], inp.placeholder_style.unwrap_or(spec.style), s, wrap, options);
                     let pl_flow = crate::el::Flow::of_layout(&pl);
                     let start = if own && pl_flow != n.flow { rest_origin[0] + ins[2] - ins[0] } else { rest_origin[0] };
                     // Right to left it ends at the field's start edge, its right.
                     let pl_x = match (pl_flow, wrap) {
                         (crate::el::Flow::Ltr, _) => start + pl_indent,
                         (crate::el::Flow::Rtl, Some(_)) => start,
-                        (crate::el::Flow::Rtl, None) => start - pl_indent - (pl.full_width() * tk).ceil(),
+                        (crate::el::Flow::Rtl, None) => start - pl_indent - text_width(pl.full_width() * tk),
                     };
                     let pl_origin = [pl_x, rest_origin[1]];
                     let pl_r_origin = if scale_motion == ScaleMotion::Still { pl_origin } else { [0.0, 0.0] };
@@ -526,7 +531,7 @@ impl<S: 'static> Runtime<S> {
                 // A still text whose quads this frame would draw as the last one did copies them,
                 // as `El::grid` rows do: `quads` is the entry to record them under otherwise.
                 let mut copied = false;
-                let mut quads: Option<((NodeId, usize), Rc<parley::Layout<crate::text::Ink>>, u64, usize, usize)> = None;
+                let mut quads: Option<((NodeId, crate::text::LayoutId), u64, usize, usize)> = None;
                 let mut pages: Option<Vec<(u16, u32)>> = None;
                 let zoom = if let (Some(r), Some((_, at))) = (&n.run_layout, &spec.cold.advance_in)
                     && let Some(x) = r.x(*at)
@@ -556,7 +561,10 @@ impl<S: 'static> Runtime<S> {
                     let shared = piece.shared.or(laid.single());
                     let still = scale_motion == ScaleMotion::Still && glide == [0.0; 2] && !bytes && !place_masks
                         && !self.flights.iter().any(|f| f.lands(&n.path, n.key.as_deref()));
-                    if let Some(l) = shared.filter(|_| still && !direct && !secret) {
+                    // A layout whose stamp the id table dropped draws from its glyphs, uncopied.
+                    if let Some(l) = shared.filter(|_| still && !direct && !secret)
+                        && let Some(layout_id) = self.text.layout_id(l)
+                    {
                         use std::hash::{Hash, Hasher};
                         let mut h = rune_motion::Fx::default();
                         (origin.map(f32::to_bits), clip.map(f32::to_bits), fade.map(f32::to_bits), shown.map(f32::to_bits), [tk, raster, s].map(f32::to_bits)).hash(&mut h);
@@ -564,17 +572,21 @@ impl<S: 'static> Runtime<S> {
                         for sp in spans_here.iter() {
                             sp.color.map(|c| premul(c, o, srgb).map(f32::to_bits)).hash(&mut h);
                         }
-                        let (id, key) = ((n.id, Rc::as_ptr(l) as usize), h.finish());
-                        match self.text_quads.get_mut(&id).filter(|(held, d, _)| Rc::ptr_eq(held, l) && d.key == key) {
-                            Some((_, d, used)) => {
+                        let (id, key) = ((n.id, layout_id), h.finish());
+                        match self.text_quads.get_mut(&id).filter(|(d, _)| d.key == key) {
+                            Some((d, used)) => {
                                 *used = self.quads_frame;
                                 self.instances.extend_from_slice(&d.instances);
                                 d.pages.iter().for_each(|&(page, texels)| self.text.touch_quad(page, texels));
                                 *glyph_count += d.glyphs;
                                 copied = true;
+                                #[cfg(test)]
+                                {
+                                    self.quads_copied += 1;
+                                }
                             }
                             None => {
-                                quads = Some((id, l.clone(), key, self.instances.len(), *glyph_count));
+                                quads = Some((id, key, self.instances.len(), *glyph_count));
                                 pages = Some(Vec::new());
                             }
                         }
@@ -649,9 +661,9 @@ impl<S: 'static> Runtime<S> {
                         }
                     }
                 }
-                if let (Some((id, layout, key, start, glyphs)), Some(pages)) = (quads, pages) {
+                if let (Some((id, key, start, glyphs)), Some(pages)) = (quads, pages) {
                     let d = crate::el::grid::DrawnRow { key, instances: self.instances[start..].to_vec(), pages, glyphs: *glyph_count - glyphs };
-                    self.text_quads.insert(id, (layout, d, self.quads_frame));
+                    self.text_quads.insert(id, (d, self.quads_frame));
                 }
             }
             if let (Some(c), Some(inp)) = (caret, &n.input) {

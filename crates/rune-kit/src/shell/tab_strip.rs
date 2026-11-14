@@ -247,6 +247,23 @@ struct Handlers<S> {
     tear_move: Option<Commit<S, TabTearMove>>,
 }
 
+/// A tab strip's words for assistive technology ([`TabStrip::words`]): the close button's name
+/// and each status a tab's mark shows, said after the tab's title.
+#[derive(Clone, Copy, Debug)]
+pub struct TabWords {
+    pub close: &'static str,
+    pub busy: &'static str,
+    pub attention: &'static str,
+    pub unread: &'static str,
+    pub failed: &'static str,
+}
+
+impl Default for TabWords {
+    fn default() -> Self {
+        TabWords { close: "Close tab", busy: "Working", attention: "Needs attention", unread: "Unread", failed: "Failed" }
+    }
+}
+
 /// What every tab of one strip shares while it builds.
 struct Strip<S> {
     handlers: Handlers<S>,
@@ -267,7 +284,10 @@ struct Strip<S> {
     close_icon: Option<&'static Icon>,
     /// `TabStrip::close_tab_stop`.
     close_tab_stop: bool,
+    /// `TabStrip::hover_none`.
+    hover_none: bool,
     busy: fn(&Kit) -> El,
+    words: TabWords,
     scroll_key: String,
     list_key: String,
     /// A torn-out tab floats in the caller's layer ([`TabStrip::build_layered`]).
@@ -315,8 +335,10 @@ pub struct TabStrip<'a, S: 'static> {
     fill: Option<Color>,
     close_icon: Option<&'static Icon>,
     close_tab_stop: bool,
+    hover_none: bool,
     busy: fn(&Kit) -> El,
     label: String,
+    words: TabWords,
     handlers: Handlers<S>,
 }
 
@@ -341,8 +363,10 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             fill: None,
             close_icon: None,
             close_tab_stop: false,
+            hover_none: false,
             busy: busy_ring,
             label: "Tabs".into(),
+            words: TabWords::default(),
             handlers: Handlers { select: None, close: None, double: None, hover: None, reorder: None, tear_out: None, tear_move: None },
         }
     }
@@ -432,6 +456,13 @@ impl<'a, S: 'static> TabStrip<'a, S> {
     }
     /// Each tab's close button is a Tab stop after its tab with the kit's focus ring, as a web
     /// page's `<button>` is. Off, it's pointer only: the strip's arrows move between tabs.
+    /// A primary pointer that can't hover (`@media (hover: none)`, `tab-nav.css`): every tab shows
+    /// its close button on its painted slot, its status mark 16 points before it, and its title
+    /// fades clear of both, as a hover shows them.
+    pub fn hover_none(mut self, on: bool) -> Self {
+        self.hover_none = on;
+        self
+    }
     pub fn close_tab_stop(mut self, on: bool) -> Self {
         self.close_tab_stop = on;
         self
@@ -442,6 +473,12 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         self
     }
     /// The tab list's accessible name (default "Tabs").
+    /// What a screen reader hears of each tab beyond its title, in the app's language: its
+    /// close button's name and its status. English by default.
+    pub fn words(mut self, words: TabWords) -> Self {
+        self.words = words;
+        self
+    }
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.label = label.into();
         self
@@ -538,7 +575,9 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             matched: self.matched.map(str::to_owned),
             close_icon: self.close_icon,
             close_tab_stop: self.close_tab_stop,
+            hover_none: self.hover_none,
             busy: self.busy,
+            words: self.words,
             auto,
             scroll_key: format!("{}-scroll", self.key),
             list_key: format!("{}-list", self.key),

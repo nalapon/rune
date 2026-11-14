@@ -11,7 +11,7 @@ impl<S: 'static> Runtime<S> {
         // Quads a text hasn't drawn with for a while go, with the layouts they hold.
         if self.quads_frame % 64 == 0 {
             let frame = self.quads_frame;
-            self.text_quads.retain(|_, (_, _, used)| frame - *used < 64);
+            self.text_quads.retain(|_, (_, used)| frame - *used < 64);
         }
         let mut pinned_pages = 0u32;
         for f in &self.flights {
@@ -285,6 +285,10 @@ impl<S: 'static> Runtime<S> {
             } else {
                 pinh.group
             };
+            let (pressed, press_to) = match n.vis.cold.get().and_then(|c| c.press_color) {
+                Some(c) => (self.scene.get(n.id, P_PRESS).unwrap_or(0.0).clamp(0.0, 1.0), Some(c)),
+                None => (pinh.pressed, pinh.press_to),
+            };
             // Loops and reveals run on the node's clock (`El::time_scale`).
             let track = self.loops.get(&n.id);
             let lnow = if track.is_some() { self.scene.store().node_time(n.id) } else { self.t };
@@ -439,7 +443,8 @@ impl<S: 'static> Runtime<S> {
             } else {
                 pinh.snap.layer
             };
-            let rest = if snaps && animating { self.scene.rest(n.id) } else { None };
+            let steps = pinh.snap.steps || n.vis.cold.get().is_some_and(|c| c.motion_snaps);
+            let rest = if snaps && animating && !steps { self.scene.rest(n.id) } else { None };
             let gliding = snaps && (rest.is_some() || !unscaled);
             let (r, snap_rest) = if !snaps {
                 (r_exact, None)
@@ -1125,6 +1130,8 @@ impl<S: 'static> Runtime<S> {
                         clip,
                         fade,
                         group: pinh.group,
+                        pressed,
+                        press_to,
                         loop_value,
                         cover,
                         scale_motion,
@@ -1228,11 +1235,11 @@ impl<S: 'static> Runtime<S> {
             self.inh_scratch[i] = Inh { opacity: effective_opacity, paint_opacity: o, first_fade: kids_fade,
                 clip: full_clip, fade: hit_fade, fade_origin: hit_origin,
                 paint_clip: clip, paint_fade: fade, paint_fade_origin: fade_origin, rounded, scale, anchor, anchor_to, blur, dy, dx,
-                cover: cover_offset, outer, mark, group,
+                cover: cover_offset, outer, mark, group, pressed, press_to,
                 hit_opacity: hit_opacity * kids_fade, group_rect: if hover_owner { rect_pt } else { pinh.group_rect },
                 scale_motion, still: if scale_motion == ScaleMotion::Still { (scale, anchor, anchor_to) } else { pinh.still },
                 in_cache, skip_paint, turn: turn_index,
-                snap: pixel_snap::Inherit { off: snap_off, rigid: snap_rigid, contain: snap_contain, layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap_rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)) } };
+                snap: pixel_snap::Inherit { off: snap_off, rigid: snap_rigid, contain: snap_contain, steps, layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap_rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)) } };
             // Shown only under its group's hover, it takes presses where the pointer hovers the
             // group: a press in the same frame as the move that reveals it finds it, as a page's
             // `:hover` applies before the press does.

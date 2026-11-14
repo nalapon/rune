@@ -36,7 +36,7 @@ mod variant;
 #[cfg(target_os = "macos")]
 mod windfoil_metallib;
 pub use backdrop_blur::MAX_BACKDROP_BLURS;
-pub use first_use::precompiled_misses;
+pub use first_use::{make_layer_blur, make_straight_alpha, precompiled_misses};
 pub use layers::LayerStats;
 
 /// Rounded rect in `fill` with a `params.x`-wide `border` ring drawn over it, as CSS paints a
@@ -789,6 +789,9 @@ pub struct Renderer {
     fills: std::sync::Mutex<Option<fill::PendingFills>>,
     /// Unique to this renderer, so to the device it was made on (`Frame::device_key`).
     device_key: crate::compose::DeviceKey,
+    /// The device's largest 2D texture, read once: in a browser each `Device::limits` reads every
+    /// limit from JavaScript (about 35 µs), which a frame's layers used to pay.
+    max_texture_dim: u32,
     /// The one instance per rectangle that clears a damaged one (`arm_damage`), made on first use.
     #[cfg(target_os = "windows")]
     clear_quad: std::sync::OnceLock<wgpu::Buffer>,

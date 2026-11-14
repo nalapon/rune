@@ -24,6 +24,8 @@ pub struct Tx {
     pub(crate) drag_repeat_after: Option<std::time::Duration>,
     /// `Tx::input_time`.
     pub(crate) input_time: Option<crate::time::Instant>,
+    /// `Tx::input_waiting`.
+    pub(crate) input_waiting: bool,
     pub(crate) physical_key: Option<crate::PhysicalKeyCode>,
     pub(crate) key_base: Option<char>,
     pub(crate) focused: Option<String>,
@@ -65,7 +67,7 @@ pub struct Tx {
     pub(crate) keep_on_screen: Vec<String>,
     pub(crate) wakes: Vec<std::time::Duration>,
     pub(crate) shell: Option<Shell>,
-    pub(crate) minimize: bool,
+    pub(crate) minimize_order: Option<std::num::NonZeroU64>,
     /// `Tx::toggle_maximized`.
     pub(crate) toggle_maximized: bool,
     /// `Tx::toggle_full_screen`.
@@ -200,8 +202,9 @@ impl Commit {
 pub(crate) enum MotionSource {
     /// A spring, as Rune's layout springs normally are.
     Spring(Spring),
-    /// A curve, with the zero-bounce spring of its duration for what only takes a spring
-    /// (scroll requests, matched flights).
+    /// A curve, with the zero-bounce spring of its duration for what the layout moves but only
+    /// takes a spring (matched flights). Scroll requests aren't one: they glide on the spring
+    /// they name.
     Curve { anim: Anim, spring: Spring },
 }
 
@@ -386,7 +389,7 @@ impl Tx {
     /// minimize button.
     /// A close or quit asked in the same change wins.
     pub fn minimize(&mut self) {
-        self.minimize = true;
+        self.minimize_order = Some(crate::app::window_request_order());
     }
 
     /// Maximize this window after this handler, or restore it when it is maximized, as its
@@ -506,6 +509,8 @@ impl Tx {
     /// Whether an assistive client (a screen reader, Voice Access, an automation tool) is
     /// reading this window's accessibility tree: the tree is built only then. Work done only for
     /// one, such as deciding what [`Tx::announce`] says, can wait for it and cost nothing without.
+    /// In a browser it's always true: a page can't tell whether a screen reader reads it, and
+    /// its mirror and live regions are always there.
     pub fn assistive_technology(&self) -> bool {
         self.assistive
     }
@@ -660,15 +665,18 @@ impl Tx {
         self.commit = self.commit.animated();
         self.asked_motion = true;
     }
-    /// Animate this change's layout with `spring` instead of each element's own.
+    /// Animate this change's layout with `spring` instead of each element's own. Scroll
+    /// requests keep the spring they name; see [`Self::motion_curve`].
     pub fn motion(&mut self, spring: Spring) {
         self.motion = Some(MotionSource::Spring(spring));
     }
     /// Animate this change's layout on `anim` instead of each element's own spring: a spring,
     /// or a fixed-duration eased tween to compare against one
     /// (`tx.motion_curve(Curve::tween(0.35, Easing::cubic(0.16, 1.0, 0.3, 1.0)))`). What
-    /// moves with the layout but only takes a spring (scroll requests, matched flights) uses a
-    /// zero-bounce spring of the curve's duration. The last `motion` or `motion_curve` wins.
+    /// moves with the layout but only takes a spring (matched flights) uses a zero-bounce
+    /// spring of the curve's duration. Scroll requests don't follow it: each glides on the
+    /// spring it names, [`Self::scroll_to_with`]'s or `tok::motion::GLIDE`. The last `motion` or
+    /// `motion_curve` wins.
     pub fn motion_curve(&mut self, anim: impl Into<Anim>) {
         self.motion = Some(MotionSource::curve(anim.into()));
     }

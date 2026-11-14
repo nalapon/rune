@@ -37,6 +37,8 @@ mod create;
 #[cfg(target_os = "windows")]
 mod cpu_frame;
 #[cfg(target_os = "windows")]
+mod post_frame;
+#[cfg(target_os = "windows")]
 mod video_layer;
 mod native;
 use native::Native;
@@ -172,6 +174,8 @@ pub(crate) trait AnyHost {
     fn quit_hook(&mut self) {}
     /// The app quits: off the screen now, before any hook runs.
     fn vanish(&mut self) {}
+    /// The close about to come ends the app (`Host::close`).
+    fn closing_ends_app(&mut self) {}
     /// Ends a tracking pop-up menu and answers waiting ones `None`, before the host drops or
     /// the loop exits.
     fn cancel_menus(&mut self) {}
@@ -387,6 +391,14 @@ impl ApplicationHandler<WakeEvent> for Windows {
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let _handling = crate::quit::handling();
+        // The last window's close ends a fast-exiting app: the window can go at once.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(event, WindowEvent::CloseRequested) && crate::quit::fast_exit_hook().is_some()
+            && !self.hosts.iter().flatten().any(|h| !h.owns(id) && !h.finished() && h.keeps_loop())
+            && let Some(host) = self.hosts.iter_mut().flatten().find(|h| h.owns(id) && h.keeps_loop())
+        {
+            host.closing_ends_app();
+        }
         if let Some(host) = self.hosts.iter_mut().flatten().find(|h| h.owns(id)) {
             let _input = crate::input::time::arrived(&event);
             host.window_event(event_loop, id, event);
@@ -470,7 +482,14 @@ struct Host<S: 'static> {
     spec: AppSpec<S>,
     args: Args,
     keep_running: bool,
+    /// What the window still owes after its first frame (`post_frame`).
+    #[cfg(target_os = "windows")]
+    chores: post_frame::Chores,
+    /// Its close ends the app (`Windows::window_event`): the last window of a fast-exiting app.
+    ends_app: bool,
     on_close: Option<fn(&mut S, &mut Tx)>,
+    /// `App::on_rest`.
+    on_rest: Option<fn(&mut S, &mut Tx) -> bool>,
     on_quit: Option<fn(&mut S, &mut Tx)>,
     /// `App::turn_scope`, and whether a turn is in it now.
     turn_scope: Option<crate::app::TurnScope<S>>,
@@ -546,6 +565,7 @@ impl<S: 'static> Host<S> {
             let _ = proxy.send_event(WakeEvent::App(slot));
         });
         let (open, keep_running, on_close, release_gpu) = (app.open, app.keep_running, app.on_close, app.release_gpu);
+        let on_rest = app.on_rest;
         let (on_reopen, on_quit, turn_scope) = (app.on_reopen, app.on_quit, app.turn_scope);
         #[cfg(target_os = "macos")]
         let present_log = args.trace.as_ref().map(|_| Arc::default());
@@ -627,7 +647,11 @@ impl<S: 'static> Host<S> {
             spec,
             args,
             keep_running,
+            #[cfg(target_os = "windows")]
+            chores: Default::default(),
+            ends_app: false,
             on_close,
+            on_rest,
             on_quit,
             turn_scope,
             turn: any_host::Turn::Between,

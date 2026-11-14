@@ -159,16 +159,38 @@ impl<S: 'static> Runtime<S> {
     /// Returning false after changing state the view reads leaves the screen stale until the
     /// next change.
     pub fn update_if(&mut self, f: impl FnOnce(&mut S, &mut Tx) -> bool) -> bool {
+        self.update_inner(f, false).0
+    }
+
+    /// `update_if` for an update a window drain runs: a minimize it asked for comes back instead
+    /// of reaching the minimize machine, so the drain can order it against the handle requests it
+    /// took. A pick callback that replaces its `Tx` discards the minimize, as running the
+    /// callbacks before reading `Tx::minimize` does; one the callback asks for itself still
+    /// latches. Returns stale, then the minimize's order when it survived.
+    pub(crate) fn update_if_ordered(&mut self, f: impl FnOnce(&mut S, &mut Tx) -> bool) -> (bool, Option<std::num::NonZeroU64>) {
+        self.update_inner(f, true)
+    }
+
+    fn update_inner(&mut self, f: impl FnOnce(&mut S, &mut Tx) -> bool, ordered: bool) -> (bool, Option<std::num::NonZeroU64>) {
         // Its wakes count from now (`schedule_pending_wakes`), so its clock reads now too.
         let mut one = Tx { clock: self.now_clock(), ..self.transaction() };
         let changed = crate::tooling::perf_warn::timed("an `update` closure", || f(&mut self.state, &mut one));
         let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.font_smoothing())
             || self.changes_families(&one)
             || (one.blur && self.focus.path().is_some());
-        self.latch_requests(&mut one);
+        let minimize = if ordered {
+            let asked = one.minimize_order;
+            self.run_pick_reads(&mut one);
+            let survived = if asked.is_some() && one.minimize_order == asked { one.minimize_order.take() } else { None };
+            self.latch_after_picks(&mut one);
+            survived
+        } else {
+            self.latch_requests(&mut one);
+            None
+        };
         merge(&mut self.pending, one);
         self.dirty |= changed;
-        stale
+        (stale, minimize)
     }
 
     /// Takes a `Tx::minimize` that `what` can't carry out, saying so in debug builds.
@@ -185,8 +207,13 @@ impl<S: 'static> Runtime<S> {
     /// memory clipboard at once. A secret clear drops an earlier secret copy not yet written.
     pub(super) fn latch_requests(&mut self, tx: &mut Tx) {
         self.run_pick_reads(tx);
+        self.latch_after_picks(tx);
+    }
+
+    /// [`Self::latch_requests`] once the pick callbacks have run.
+    fn latch_after_picks(&mut self, tx: &mut Tx) {
         self.shell_request = self.shell_request.max(tx.shell.take());
-        if std::mem::take(&mut tx.minimize) { self.minimize_step(crate::window::MinimizeEvent::Asked); }
+        if tx.minimize_order.take().is_some() { self.minimize_step(crate::window::MinimizeEvent::Asked); }
         self.titlebar.toggle_maximized |= std::mem::take(&mut tx.toggle_maximized);
         self.titlebar.toggle_full_screen |= std::mem::take(&mut tx.toggle_full_screen);
         for ev in std::mem::take(&mut tx.keys) { self.key(ev); }
@@ -232,7 +259,9 @@ impl<S: 'static> Runtime<S> {
                 self.set_focus(None, self.focus.keyboard());
                 self.dirty = true;
             }
-            // An explicit blur is not the temporary pointer-down blur of a scrim.
+            // An explicit blur is not the temporary pointer-down blur of a scrim, and nothing
+            // hands focus on from it: only a control the user blurred and then left does.
+            self.focus.step(focus_machine::FocusEvent::Dropped);
             self.focus.step(focus_machine::FocusEvent::Settled);
         }
         if let Some(request) = tx.focus_to.take() {
@@ -290,7 +319,7 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn transaction(&self) -> Tx {
         Tx { trace: self.tracing().then(crate::el::TraceCalls::default), mods: self.held_mods, selection: self.selection_snapshot(),
-            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), focused: self.focused_key(), assistive: self.a11y.is_some(), ..Tx::default() }
+            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), focused: self.focused_key(), assistive: self.a11y.is_some() || cfg!(target_arch = "wasm32"), ..Tx::default() }
     }
 
     /// A scalar from the actual draw path (e.g. `shell.width`). Values hold until resampled.
@@ -485,6 +514,7 @@ impl<S: 'static> Runtime<S> {
         if let Some(at) = wake { self.schedule_wakes([std::time::Duration::from_secs_f64((at - self.clock).max(0.0))]); }
         if let Some(poll) = self.poll.filter(|_| !polled) {
             let mut one = self.transaction();
+            one.input_waiting = self.queue.has_input();
             // Scheduling does not imply a model change.
             if self.idle_meter.polled(crate::tooling::perf_warn::timed("poll", || app_call!(poll, &mut self.state, self.clock, &mut one))) {
                 ran = true;
@@ -519,6 +549,7 @@ impl<S: 'static> Runtime<S> {
         let mut pointer_hover = false;
         for Queued { action, at } in queue {
             let _input = crate::input::time::scope(at);
+            if matches!(action, Action::Key { stage: false, .. } | Action::Physical(crate::PhysicalInput::Key { pressed: true, .. }, _)) { crate::marks::input_handled(true); }
             pointer_hover |= matches!(action, Action::Hover(_));
             // State may have requested focus on a newly mounted field. Resolve the
             // new tree before routing this frame's text, not after it has gone to
