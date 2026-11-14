@@ -283,16 +283,18 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Where node `i`'s text starts, in whole cells: a centred text on an odd width starts on
-    /// the cell before the half, and a scrolled field's text starts before its box.
+    /// the cell before the half, and a scrolled field's text starts before its box. The box
+    /// itself lands on the cell its edges round to, as its fill and border do, so a box laid out
+    /// on a half cell (centred in an odd gap) keeps its first line inside it.
     fn cell_text_origin(&self, i: usize, rect: [f32; 4]) -> Option<[f32; 2]> {
         let n = &self.nodes[i];
         let (spec, layout) = (n.text.as_ref()?, n.text_layout.as_ref()?);
         let (x0, x1) = (rect[0] + n.inset[0], rect[2] - n.inset[2]);
-        let mut origin = [text_x(spec, x0, x1, layout.view().full_width().ceil(), layout.view().flow()), rect[1] + n.inset[1]];
+        let mut within = [text_x(spec, x0, x1, layout.view().full_width().ceil(), layout.view().flow()) - rect[0], n.inset[1]];
         if n.input.as_ref().is_some_and(|i| i.single_line) {
-            origin[0] -= self.input_scroll.get(&n.path).copied().unwrap_or(0.0);
+            within[0] -= self.input_scroll.get(&n.path).copied().unwrap_or(0.0);
         }
-        Some(origin.map(f32::floor))
+        Some([rect[0].round() + within[0].floor(), rect[1].round() + within[1].floor()])
     }
 
     /// What decorates byte ranges of node `i`'s drawn text: the selection (a field's own or a

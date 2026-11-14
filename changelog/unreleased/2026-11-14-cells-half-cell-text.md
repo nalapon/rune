@@ -1,0 +1,1 @@
+- `--term cells`: a text in a box laid out on a half cell (centred in an odd gap) starts on the cell its box rounds to, so its first line is no longer cut off.
