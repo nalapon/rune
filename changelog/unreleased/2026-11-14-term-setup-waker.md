@@ -1,0 +1,1 @@
+- `--term` and `--term cells`: the waker `AppSpec::setup` gets runs `poll` on the next frame, as a window's does, so work a thread finishes shows without waiting for a key.

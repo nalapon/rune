@@ -119,7 +119,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
     let waker = tty.waker();
     shared.connect(waker.clone());
     let mut clipboard = Clipboard::new(waker.clone());
-    let mut rt: Runtime<S> = runtime_for(&spec, state, (cols as f32, rows as f32), Env::new(dark, 1.0), waker);
+    let mut rt: Runtime<S> = runtime_for(&spec, state, (cols as f32, rows as f32), Env::new(dark, 1.0), super::app_waker(&shared));
     crate::text::set_cell_font(cell_font_size(&mut rt));
     rt.set_os_drag(false);
     rt.record_events = false;
@@ -164,8 +164,10 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
         if fed.quit { break; }
         if released { clipboard.released(&mut rt); }
         asked |= fed.acted || fed.moved;
-        let updates = shared.take().updates;
-        asked |= !updates.is_empty();
+        // `setup`'s waker (`AppHandle::wake`) asks for `poll`, as in a window.
+        let requests = shared.take();
+        let updates = requests.updates;
+        asked |= requests.woken || !updates.is_empty();
         for f in updates { rt.update_if(f); }
         asked |= clipboard.step(&mut rt, &tty);
         pointer.show(&rt, &tty);

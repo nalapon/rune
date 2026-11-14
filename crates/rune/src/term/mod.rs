@@ -226,6 +226,13 @@ impl Target {
     }
 }
 
+/// The waker `setup` gets: `AppHandle::wake`, which wakes the loop (the shared requests are
+/// connected to the terminal's wake pipe) and asks it for `poll`, as a window's does.
+pub(super) fn app_waker<S: 'static>(shared: &std::sync::Arc<crate::app::Shared<S>>) -> Waker {
+    let handle = crate::AppHandle { shared: shared.clone() };
+    std::sync::Arc::new(move || handle.wake())
+}
+
 /// Whether `--term` without a transport draws pixels: the terminal reports its pixel size and
 /// answers a Kitty graphics query. Otherwise it draws on the character grid (`--term cells`).
 pub(crate) fn shows_pixels() -> bool {
@@ -258,7 +265,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
     let writer = Writer::start(transport, waker.clone());
     let mut sink = Sink { writer, unsent: Unsent::default(), transport, stats: Stats::default(), check: Check::from_env() };
     shared.connect(waker.clone());
-    let mut rt: Runtime<S> = runtime_for(&spec, state, logical(size), Env::new(dark, scale), waker);
+    let mut rt: Runtime<S> = runtime_for(&spec, state, logical(size), Env::new(dark, scale), app_waker(&shared));
     renderer.attach_text(&mut rt.text.atlas);
     rt.set_srgb_blend(srgb_blend);
     rt.set_font_smoothing(font_smoothing);
@@ -300,8 +307,10 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
         if fed.quit { break; }
         if released { clipboard.released(&mut rt); }
         (asked, moved) = (asked || fed.acted, moved || fed.moved);
-        let updates = shared.take().updates;
-        asked |= !updates.is_empty();
+        // `setup`'s waker (`AppHandle::wake`) asks for `poll`, as in a window.
+        let requests = shared.take();
+        let updates = requests.updates;
+        asked |= requests.woken || !updates.is_empty();
         for f in updates { rt.update_if(f); }
         asked |= clipboard.step(&mut rt, &sink.writer);
         pointer.show(&rt, &sink.writer);
