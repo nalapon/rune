@@ -133,7 +133,7 @@ impl<S: 'static> Measurement<'_, S> {
                 // The new nodes lay their text out again; the cache then holds the only reference.
                 // A by-paragraph field's goes with it, to re-break its paragraphs from.
                 let kept = slot.text_layout.take().filter(|l| matches!(l, TextLayout::Paragraphs(_)));
-                let mut copy = Node { elided: None, virtual_mount: false, text_layout: kept, ..slot.clone() };
+                let mut copy = Node { elided: None, virtual_mount: false, text_layout: kept, epoch: crate::runtime::paint_keep::next_epoch(), ..slot.clone() };
                 copy.clear_run_layout();
                 nodes.push(copy);
             } else {
@@ -197,9 +197,9 @@ impl<S: 'static> Measurement<'_, S> {
         for v in self.virtuals.values_mut() {
             let scroll = self.path_ids.get(&v.scroll_path).and_then(|id| self.scrolls.get(id));
             let sticky = || self.nodes.iter().find(|n| n.path == v.scroll_path).and_then(|n| n.scroll).is_some_and(|s| s.stick_bottom);
-            let pinned = scroll.map_or_else(sticky, |s| s.pinned());
-            let offset = (scroll.map_or(0.0, |s| s.offset as f32) - v.top).max(0.0);
-            v.anchor = if pinned { None } else { v.first_visible(offset.min(v.max_offset()), |_| true) };
+            let held = scroll.map_or_else(sticky, |s| s.pinned());
+            let (offset, pinned) = v.locate(scroll.map_or(0.0, |s| s.offset as f32), held);
+            v.anchor = if pinned || v.passed() { None } else { v.first_visible(offset.min(v.max_offset()), |_| true) };
         }
     }
 
@@ -221,8 +221,8 @@ impl<S: 'static> Measurement<'_, S> {
     fn windows_move(&self) -> bool {
         self.virtuals.values().any(|v| {
             self.path_ids.get(&v.scroll_path).and_then(|id| self.scrolls.get(id)).is_some_and(|s| {
-                let offset = (s.offset as f32 - v.top).max(0.0);
-                v.needs_window(offset, s.pinned()) || v.spare(offset, s.pinned()) > v.viewport
+                let (offset, pinned) = v.at(s.offset as f32, s.pinned());
+                v.needs_window(offset, pinned) || v.spare(offset, pinned) > v.viewport
             })
         })
     }

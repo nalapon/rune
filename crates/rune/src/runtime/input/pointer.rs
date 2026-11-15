@@ -217,7 +217,7 @@ impl<S: 'static> Runtime<S> {
         // A press is the hand's: hover follows the pointer through moving layout.
         self.release_hover_hold();
         self.focus.step(focus_machine::FocusEvent::Pointed);
-        self.press_help(x, y);
+        self.dismiss_help();
         // A press cancels the waits to report an enter; the next move after it starts them again.
         self.press_hover_delays();
         self.hover_paused = true;
@@ -488,12 +488,16 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// The innermost scroll viewport at (x, y) that moves on the horizontal axis or the vertical.
+    /// One whose content fits on that axis is passed over for the one around it, as Chromium
+    /// skips a scroller with nothing to scroll: a list of sections, each its own viewport as
+    /// tall as its rows, scrolls from over any row.
     pub(super) fn scroll_at_axis(&self, x: f32, y: f32, horizontal: bool) -> Option<NodeId> {
         self.nodes
             .iter()
             .enumerate()
             .rev()
             .filter(|(i, n)| n.scroll.is_some() && n.scroll_axes.has(horizontal) && !self.subtree_exiting(*i) && self.allowed(*i))
+            .filter(|(_, n)| self.scrolls.get(&n.id).is_some_and(|st| if horizontal { st.x.max } else { st.max } > 0.0))
             .find(|(i, _)| self.node_contains(*i, x, y))
             .map(|(_, n)| n.id)
     }

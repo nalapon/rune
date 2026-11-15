@@ -4,6 +4,9 @@ use super::*;
 pub(super) struct LeafBox {
     pub r: [f32; 4],
     pub r_exact: [f32; 4],
+    /// Where its exact box rests against where its snapped box rests (device px), its paint
+    /// containment's rounding in: Blink's text lays out from the exact place.
+    pub exact_off: [f32; 2],
     pub raw_size: [f32; 2],
     /// The paint containment's origin above (`El::paint_contained`), device px: what draws
     /// from its exact box's origin rounds against it, as Blink rounds inside it.
@@ -53,6 +56,7 @@ impl<S: 'static> Runtime<S> {
         let LeafBox {
             r,
             r_exact,
+            exact_off,
             raw_size,
             contain,
             radii,
@@ -123,6 +127,7 @@ impl<S: 'static> Runtime<S> {
             // window: off screen it isn't painted, so it asks for nothing.
             if let Some((_, Some(at))) = placed && self.live.visible() && self.time_scale > 0.0 {
                 let wake = self.clock + (at - now).max(0.0) / self.time_scale as f64;
+                self.paint_keep.cycles.other_deadline();
                 if self.loop_wake.is_none_or(|w| wake < w.0) { self.loop_wake = Some((wake, at)); }
             }
             if let Some((image, _)) = placed {
@@ -236,10 +241,24 @@ impl<S: 'static> Runtime<S> {
             }
             let direct = self.text.emit() == crate::text::outline::Emit::Outline;
             let ins = n.inset.map(|v| v * zk * s);
+            // Text lays out from its box's place moved by how far its exact resting box sits from its
+            // snapped one (inside its paint containment), as Blink paints a text fragment from its
+            // exact place: its glyphs then round as Skia rounds them (the baseline half up, pens to
+            // a quarter pixel) where Chromium has them, rather than from a box already snapped. A
+            // gliding box carries its rest's offset, so the frame a glide ends or
+            // a flight lands places glyphs exactly as the resting frame after it. A field keeps its
+            // snapped box, which its caret and selection share.
+            let zr = if scale_motion == ScaleMotion::Still && (sc - 1.0).abs() < 1e-5 && n.input.is_none() {
+                let by = exact_off;
+                [zr[0] + by[0], zr[1] + by[1], zr[2] + by[0], zr[3] + by[1]]
+            } else {
+                zr
+            };
             let (x0, x1) = (zr[0] + ins[0], zr[2] - ins[2]);
             let mut origin = [text_x(spec, x0, x1, text_width(flow.full_width() * tk), flow.flow()), zr[1] + ins[1]];
-            // A gliding box's glyphs and decorations lay out from its nearest whole pixel and move the rest.
-            // Within a 64th of a pixel they don't move, but still lay out from that pixel, as at rest.
+            // A gliding box's glyphs and decorations lay out from its nearest whole pixel (plus its rest's
+            // fraction, above) and move the rest. Within a 64th of a pixel they don't move, but still lay
+            // out from that pixel, as at rest.
             let (glide, off) = if gliding && cover.is_none() && scale_motion == ScaleMotion::Still {
                 ([pixel_snap::text_glide(r[0]), pixel_snap::text_glide(r[1])], [r[0] - r[0].round(), r[1] - r[1].round()])
             } else {
@@ -361,9 +380,19 @@ impl<S: 'static> Runtime<S> {
                 }
                 // Misspelled words (`El::spellcheck`), but the one the caret is typing.
                 if inp.spellcheck && !e.is_secure() && e.preedit().is_none() && !departing {
-                    let found = crate::spell::misspelled(&e.text, Some(self.live.waker()));
+                    // Windows and the web check word by word, so the paragraphs shown are checked
+                    // alone: a 20,000-line draft hashes and walks only what's on screen. macOS
+                    // finds each text's language from the whole of it.
+                    let (from, to) = (shown_a.min(e.text.len()), shown_b.min(e.text.len()));
+                    let found = if cfg!(any(target_os = "windows", target_arch = "wasm32")) && (from > 0 || to < e.text.len()) && e.text.is_char_boundary(from) && e.text.is_char_boundary(to) {
+                        std::rc::Rc::new(crate::spell::misspelled(&e.text[from..to], Some(self.live.waker())).iter().map(|&(a, b)| (a + from, b + from)).collect::<Vec<_>>())
+                    } else {
+                        crate::spell::misspelled(&e.text, Some(self.live.waker()))
+                    };
                     // The word typing left the caret in waits unmarked until the pause ends (`spell::pause`).
-                    let caret = if e.focused { crate::spell::pause::observe(&mut self.spell_watch, &n.path, &e.text, e.range(), self.clock) } else { None };
+                    // Typing shows in the paragraphs shown, the caret's among them.
+                    let watched = if e.text.is_char_boundary(from) && e.text.is_char_boundary(to) { &e.text[from..to] } else { e.text.as_str() };
+                    let caret = if e.focused { crate::spell::pause::observe(&mut self.spell_watch, &n.path, watched, e.range(), self.clock) } else { None };
                     let color = premul(SPELLING, o, srgb);
                     for &(a, b) in found.iter().filter(|&&(a, b)| caret.is_none_or(|c| c < a || c > b)) {
                         let (da, db) = e.display_selection_range(a, b);
@@ -383,6 +412,9 @@ impl<S: 'static> Runtime<S> {
             let em = spec.spans.iter().filter_map(|sp| sp.size).fold(spec.style.size.max(spec.style.line_px()), f32::max);
             let pad = 2.0 * em * s + 2.0 / raster.max(1e-4);
             let rows = if tk > 1e-4 { (shown[0] - rest_origin[1]) / tk - pad..(shown[1] - rest_origin[1]) / tk + pad } else { f32::NEG_INFINITY..f32::INFINITY };
+            if let crate::text::TextLayout::Paragraphs(p) = laid && p.waiting() {
+                self.text_rows.insert(n.id, (rows.start, rows.end));
+            }
             for piece in flow.pieces_in(rows.start, rows.end) {
                 let layout = piece.layout;
                 let (origin, rest_origin) = ([origin[0], origin[1] + piece.y * tk], [rest_origin[0], rest_origin[1] + piece.y * tk]);

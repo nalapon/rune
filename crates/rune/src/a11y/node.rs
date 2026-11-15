@@ -15,13 +15,17 @@ const NAME_MAX: usize = 400;
 
 impl<S: 'static> Runtime<S> {
     /// Node `i`'s role in the tree, or `None` when it joins its parent.
-    pub(super) fn a11y_role(&self, i: usize) -> Option<Role> {
+    pub(crate) fn a11y_role(&self, i: usize) -> Option<Role> {
         let n = &self.nodes[i];
         let handlers = n.handlers.get();
         let input = n.input.as_deref();
         let text = n.text.as_deref().filter(|_| input.is_none());
+        // A group that takes its own keys and no press (a game's surface: arrows, Space) is
+        // no button even when it steers by drag: Return or Space doesn't press it. As the web
+        // mirror has it, a labelled one stays a group.
+        let owns_keys = n.role == "group" && n.focus.key.is_some() && handlers.is_none_or(|h| h.on_press.is_none() && h.on_double_press.is_none());
         let cx = RoleCtx {
-            pressable: handlers.is_some_and(|h| h.has_primary()),
+            pressable: handlers.is_some_and(|h| h.has_primary()) && !owns_keys,
             focusable: self.takes_focus(n),
             input: input.is_some(),
             multiline: input.is_some_and(|i| !i.single_line),
@@ -250,7 +254,7 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// The element node `i`'s `El::active_descendant` names, if it is in the tree.
-    fn a11y_active_descendant(&self, i: usize) -> Option<usize> {
+    pub(crate) fn a11y_active_descendant(&self, i: usize) -> Option<usize> {
         let key = self.nodes[i].a11y.more.as_deref()?.active.as_deref()?;
         // Its own rows first: a row id may also key something elsewhere.
         let inside = |j: &usize| std::iter::successors(self.nodes[*j].parent, |&p| self.nodes[p].parent).any(|p| p == i);
@@ -289,7 +293,7 @@ impl<S: 'static> Runtime<S> {
     /// The element keyed `key` nearest node `i`, which isn't leaving: the first inside its
     /// parent, else inside its grandparent, and so on out, as a component's own `"title"` is
     /// the one a control inside it means. What `El::labelled_by` and `El::described_by` name.
-    fn a11y_keyed(&self, i: usize, key: &str) -> Option<usize> {
+    pub(crate) fn a11y_keyed(&self, i: usize, key: &str) -> Option<usize> {
         let mut scope = self.nodes[i].parent;
         while let Some(s) = scope {
             let inside = |j: &usize| std::iter::successors(self.nodes[*j].parent, |&p| self.nodes[p].parent).any(|p| p == s);
@@ -302,7 +306,7 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Node `j`'s words as a name: its label, else its text, else the text inside it.
-    fn a11y_words(&self, j: usize) -> String {
+    pub(crate) fn a11y_words(&self, j: usize) -> String {
         let n = &self.nodes[j];
         if n.is_secure() { return String::new(); }
         n.label.as_deref().filter(|l| !l.trim().is_empty()).map(str::to_owned)

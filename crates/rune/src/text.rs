@@ -119,7 +119,7 @@ use glyph_emit::Face;
 use hidden_axes::hidden_axes;
 use layout_cache::{Cache, Entry};
 pub(crate) use layout_cache::Keep;
-pub(crate) use paragraphs::{ParagraphLayout, Piece, TextFlow, TextLayout};
+pub(crate) use paragraphs::{ParagraphLayout, Piece, TextFlow, TextLayout, common_end, common_start};
 #[cfg(test)]
 use layout_cache::STALE_BYTES;
 pub use icon::{Icon, icon_coverage, icon_coverage_placed, set_icon_swap, set_icon_swap_size};
@@ -222,6 +222,13 @@ pub struct TextSystem {
     /// How many times `drop_shaped` ran. Paragraph keys take it, so a field's next layout
     /// doesn't keep paragraphs its last one shaped in other fonts or another language.
     shaped_epoch: u64,
+    /// The bytes the last two texts compared this commit share at their start and end, and the
+    /// two texts (address and length): measuring a field at its two widths compares it once.
+    last_diff: Option<([usize; 4], usize, usize)>,
+    /// A long paste's lines as one width's keying read them this layout pass, for the other's.
+    line_scan: Option<paragraphs::LineScan>,
+    /// Printable ASCII's advances and line height per style and scale (`paragraphs::AsciiLine`).
+    ascii: HashMap<u64, Option<Rc<paragraphs::AsciiLine>>>,
     runs: Cache<Rc<RunLayout>>,
     generation: u32,
     /// The id of the layout at each address one was built or re-broken at (`layout_id`).
@@ -369,6 +376,9 @@ impl TextSystem {
             paragraphs: Default::default(),
             last_paragraphs: None,
             shaped_epoch: 0,
+            last_diff: None,
+            line_scan: None,
+            ascii: HashMap::default(),
             runs: Default::default(),
             generation: 0,
             layout_ids: LayoutIds::default(),

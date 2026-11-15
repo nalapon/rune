@@ -6,6 +6,7 @@ impl<S: 'static> Runtime<S> {
         let (_paint_time, _blend) = (crate::frame::profile::Scope::new(crate::frame::profile::Phase::Paint), crate::theme::scope(self.srgb_blend));
         let s = self.env.scale;
         let snap_px = |v: f32| grid(v, s) * s;
+        self.keep_swap();
         self.instances.clear();
         self.quads_frame += 1;
         // Quads a text hasn't drawn with for a while go, with the layouts they hold.
@@ -110,9 +111,13 @@ impl<S: 'static> Runtime<S> {
                 || self.scene.presented(n.id).is_some_and(|p| (p.opacity > 0.0 && p.opacity < 1.0) || p.blur > 0.0 || p.transform.rotate.abs() > 1e-6))
         });
         let default_ring = self.default_ring_owner();
+        self.keep_begin(tree_order, vp, default_ring, &sel_ranges, &mark_ranges);
         let mut active_cache: Option<ActiveCache> = None;
         self.pixel_snap.begin_frame(self.t, [vp[2], vp[3]]);
+        // One past the subtree the last one copied from the last paint.
+        let mut skip_to = 0;
         for paint_index in 0..n_nodes {
+            if paint_index < skip_to { continue; }
             let i = if tree_order { self.layer_paint_order[paint_index] } else { paint_index };
             if let Some(rank) = self.paint_rank.as_mut() {
                 rank.resize(n_nodes, 0);
@@ -133,6 +138,7 @@ impl<S: 'static> Runtime<S> {
                     }
                 }
             }
+            self.keep_close(Some(node_parent), &mut layers, &mut active_cache, &mut glyph_count);
             while let Some(&(ancestor, start, surface_start)) = layers.last() {
                 let mut parent = node_parent;
                 while parent.is_some_and(|p| p != ancestor) { parent = self.nodes[parent.unwrap()].parent; }
@@ -145,6 +151,7 @@ impl<S: 'static> Runtime<S> {
                 }
                 layers.pop();
             }
+            self.keep_open(i, glyph_count, &sel_ranges, &mark_ranges);
             let n = &self.nodes[i];
             let Some(p) = self.scene.presented(n.id) else { continue };
             let mut pinh = n.parent.map_or_else(|| self.root_inh(), |pr| self.inh_scratch[pr]);
@@ -205,6 +212,11 @@ impl<S: 'static> Runtime<S> {
                     pinh.paint_fade_origin[slot] = origin;
                 }
             }
+            if let Some(len) = self.keep_or_paint(i, &pinh, &mut glyph_count) {
+                skip_to = paint_index + len;
+                continue;
+            }
+            let n = &self.nodes[i];
             if raised {
                 // Out of its ancestors' layers: their opacity applies directly instead.
                 pinh.paint_opacity = pinh.opacity;
@@ -558,6 +570,7 @@ impl<S: 'static> Runtime<S> {
                 }
                 if self.time_scale > 0.0 && node_k > 0.0 && let Some(start) = track.pending_start(lnow) {
                     let window_start = now + (start - lnow) / node_k;
+                    self.paint_keep.cycles.other_deadline();
                     let wake = self.clock + (window_start - now) / self.time_scale as f64;
                     if self.loop_wake.is_none_or(|w| wake < w.0) { self.loop_wake = Some((wake, window_start)); }
                 }
@@ -1046,6 +1059,7 @@ impl<S: 'static> Runtime<S> {
                             match wait {
                                 Some(wait) if pulled.active && wait > crate::video::WAKE_MIN => {
                                     let wake = self.clock + wait;
+                                    self.paint_keep.cycles.other_deadline();
                                     if self.loop_wake.is_none_or(|w| wake < w.0) {
                                         self.loop_wake = Some((wake, now + wait * self.time_scale as f64));
                                     }
@@ -1071,6 +1085,19 @@ impl<S: 'static> Runtime<S> {
                     if fill == [0.0; 4] && border_kind == KIND_RECT && bw > 0.0 && sides.is_none() {
                         bands::push_ring(&mut self.instances, ring);
                     } else {
+                        if let Some(rune_motion::LoopKind::OpacityCycle(curve)) = n.looping.as_ref().map(|l| l.kind)
+                            && n.a11y.hidden && !next.is_some_and(|j| self.nodes[j].parent == Some(i))
+                            && !isolate && !in_cache && !skip_paint && loop_vis && base_opacity == 1.0
+                            && pinh.paint_opacity == 1.0 && pinh.hit_opacity == 1.0 && n.vis.layer_opacity == 1.0
+                            && n.vis.paint_alpha == 1.0 && bw == 0.0 && overlay == [0.0; 4]
+                            && self.instances.len() == primitive_start && n.text.is_none() && n.input.is_none()
+                            && n.vis.shape.is_none() && n.vis.pixels.is_none() && n.vis.effect.is_none()
+                            && n.vis.shadows.is_empty() && n.handlers.get().is_none() && n.focus.get().is_none()
+                            && !n.vis_flags.hit() && node_turn.is_none() && cover.is_none() && n.help.is_none()
+                            && curve.stops.iter().all(|&(_, a)| a.is_finite() && a > 0.001 && a <= 1.0 && base[3] * a > 0.0005)
+                        {
+                            self.paint_keep.cycles.record(i, self.instances.len(), curve, base, ring.rect);
+                        }
                         self.instances.push(Instance { fill, ..ring });
                     }
                 }
@@ -1121,6 +1148,16 @@ impl<S: 'static> Runtime<S> {
                     paint_content::LeafBox {
                         r,
                         r_exact,
+                        // Its exact resting place against its snapped one, inside its containment's
+                        // own rounding (`LeafBox::exact_off`).
+                        // Under an offset (`El::offset`, a translation as CSS transforms are) it moves
+                        // with its box, as it did before this: a glide toward a moving offset keeps
+                        // the text on its card, and lands as a card that never moved draws.
+                        exact_off: if pinh.snap.shifted || n.vis.offset != [0.0; 2] { [0.0; 2] } else {
+                            let o = snap_rest.map_or([0.0; 2], |p| p.exact_off(rigid));
+                            let c = pinh.snap.contain.map(|v| v * s);
+                            [o[0] + (c[0] + 0.5).floor() - c[0], o[1] + (c[1] + 0.5).floor() - c[1]]
+                        },
                         raw_size: [raw_edges[2] - raw_edges[0], raw_edges[3] - raw_edges[1]],
                         contain: pinh.snap.contain.map(|v| v * s),
                         radii,
@@ -1239,7 +1276,7 @@ impl<S: 'static> Runtime<S> {
                 hit_opacity: hit_opacity * kids_fade, group_rect: if hover_owner { rect_pt } else { pinh.group_rect },
                 scale_motion, still: if scale_motion == ScaleMotion::Still { (scale, anchor, anchor_to) } else { pinh.still },
                 in_cache, skip_paint, turn: turn_index,
-                snap: pixel_snap::Inherit { off: snap_off, rigid: snap_rigid, contain: snap_contain, steps, layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap_rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)) } };
+                snap: pixel_snap::Inherit { off: snap_off, rigid: snap_rigid, contain: snap_contain, steps, shifted: pinh.snap.shifted || n.vis.offset != [0.0; 2], layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap_rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)) } };
             // Shown only under its group's hover, it takes presses where the pointer hovers the
             // group: a press in the same frame as the move that reveals it finds it, as a page's
             // `:hover` applies before the press does.
@@ -1248,7 +1285,10 @@ impl<S: 'static> Runtime<S> {
             if self.has_sticky {
                 self.fade_below_header(i, s);
             }
+            self.keep_painted(i, own_turn.is_none() && !opens_snap_layer && snap_layer == 0 && !in_cache && !skip_paint && cover.is_none() && !lift && !raised);
         }
+        self.keep_close(None, &mut layers, &mut active_cache, &mut glyph_count);
+        self.keep_end();
         while let Some((_, start, surface_start)) = layers.pop() {
             if active_cache.is_some_and(|ac| ac.instance_start == start) {
                 let ac = active_cache.take().unwrap();
@@ -1262,6 +1302,7 @@ impl<S: 'static> Runtime<S> {
         // follow the hold this decides.
         let queued = self.queue.len();
         let held = self.pointer.map(|(x, y)| self.refresh_hover(x, y));
+        self.queue.observe_since(queued);
         self.update_help();
         self.layer_scratch = layers;
         self.built = true;

@@ -399,6 +399,10 @@ mod grid_paint;
 mod hit;
 #[path = "runtime/paint/build.rs"]
 mod build;
+#[path = "runtime/paint/keep.rs"]
+mod paint_keep;
+#[path = "runtime/text_fill.rs"]
+mod text_fill;
 #[path = "runtime/input/keys.rs"]
 mod keys;
 #[path = "runtime/input/pointer.rs"]
@@ -469,6 +473,8 @@ pub struct Runtime<S: 'static> {
     system_accent: crate::SystemAccent,
     /// What [`Cx::system_contrast`] reports.
     pub(crate) system_contrast: Option<crate::SystemContrast>,
+    /// What [`Cx::system_increased_contrast`] reports.
+    pub(crate) system_increased_contrast: bool,
     scroll_bars: system_settings::ScrollBarHost,
     pub time_scale: f32,
     /// The last view's `Cx::foreground` and `Cx::focus_ring`, for rows built after it and the
@@ -534,6 +540,10 @@ pub struct Runtime<S: 'static> {
     hits: Vec<(NodeId, [f32; 4])>,
     overlay_hits: Vec<[f32; 4]>,
     glyph_scratch: Vec<GlyphQuad>,
+    /// What the last paint painted, for subtrees that would paint it again (`paint_keep`).
+    paint_keep: paint_keep::PaintKeep,
+    /// The device rows of each field with waiting paragraphs its last paint showed (`text_fill`).
+    text_rows: HashMap<NodeId, (f32, f32)>,
     /// Each still text's quads as it drew them, by node and layout id, and the paint they were
     /// last used in (`paint_content`): a frame that draws it the same copies them.
     text_quads: HashMap<(NodeId, crate::text::LayoutId), (crate::el::grid::DrawnRow, u64)>,
@@ -677,6 +687,8 @@ pub struct Runtime<S: 'static> {
     focus_before_commit: Option<String>,
     /// `Tx::focus`: the key the next commit focuses, and whether its ring shows.
     focus_request: Option<(String, bool, crate::el::FocusAsk)>,
+    /// `Tx::focus_when_shown` still waiting for its element: the key and whether its ring shows.
+    focus_owed: Option<(String, bool)>,
     /// This commit's focus is a `Tx::return_focus` hand-back, which a modal opening in it
     /// doesn't take as where focus was.
     focus_returned: bool,
@@ -915,6 +927,7 @@ impl<S: 'static> Runtime<S> {
             titlebar_inset: 0.0,
             system_accent: crate::SystemAccent::DEFAULT,
             system_contrast: None,
+            system_increased_contrast: false,
             scroll_bars: Default::default(),
             time_scale: 1.0,
             defaults: Default::default(),
@@ -959,6 +972,8 @@ impl<S: 'static> Runtime<S> {
             hits: Vec::new(),
             overlay_hits: Vec::new(),
             glyph_scratch: Vec::new(),
+            paint_keep: Default::default(),
+            text_rows: HashMap::default(),
             text_quads: HashMap::default(),
             quads_frame: 0,
             #[cfg(test)]
@@ -1041,6 +1056,7 @@ impl<S: 'static> Runtime<S> {
             modal_focus: modal_focus::ModalFocus::Closed,
             focus_before_commit: None,
             focus_request: None,
+            focus_owed: None,
             focus_returned: false,
             unmounted_focused: Vec::new(),
             modal_scope: None,

@@ -146,6 +146,9 @@ pub(crate) struct Node {
     pub(super) ime_option_as_alt: bool,
     /// Placeholder left in `self.nodes` after `try_reuse_memo` moves a node into the new pass.
     pub(super) moved_stub: bool,
+    /// A new one each time it's built from its element; a node a region keeps keeps it
+    /// (`paint_keep`).
+    pub(super) epoch: u32,
 }
 
 impl std::ops::Deref for Node {
@@ -213,6 +216,7 @@ impl Node {
             ime_cursor: false,
             ime_option_as_alt: false,
             moved_stub: true,
+            epoch: 0,
         }
     }
 
@@ -259,8 +263,9 @@ impl AnimSource {
     pub const TEXT_FLIGHT: u16 = 128;
     pub const LIVE: u16 = 256;
     pub const VIRTUAL_FILL: u16 = 512;
-    pub const NAMES: [&'static str; 10] =
-        ["tracks", "growth", "scroll", "reveal", "loop", "scale-settle", "video", "text-flight", "live", "virtual-fill"];
+    pub const TEXT_FILL: u16 = 1024;
+    pub const NAMES: [&'static str; 11] =
+        ["tracks", "growth", "scroll", "reveal", "loop", "scale-settle", "video", "text-flight", "live", "virtual-fill", "text-fill"];
 
     pub fn names(bits: u16) -> Vec<&'static str> {
         Self::NAMES.iter().enumerate().filter(|(i, _)| bits & (1 << i) != 0).map(|(_, n)| *n).collect()
