@@ -38,6 +38,8 @@ struct Queue {
     closed: bool,
     /// Why encoding failed (a shared-memory object that couldn't be made): the run ends.
     failed: Option<String>,
+    /// How long a frame takes to encode and write, averaged over the last few.
+    cost: Duration,
 }
 
 pub(super) struct Writer {
@@ -60,6 +62,12 @@ impl Writer {
     /// Nothing waits: the writer took everything (it may still be writing it).
     pub(super) fn idle(&self) -> bool {
         self.queue.0.lock().unwrap().items.is_empty()
+    }
+
+    /// How long a frame takes to reach the terminal lately: motion faster than this would only
+    /// reach it as uneven skips.
+    pub(super) fn frame_cost(&self) -> Duration {
+        self.queue.0.lock().unwrap().cost
     }
 
     /// Why the writer stopped, if it did: the run ends with it. It wakes the loop when it stops.
@@ -138,6 +146,10 @@ fn write_out(queue: &(Mutex<Queue>, Condvar), mut kitty: Kitty, wake: &Waker) ->
                     if !bytes.is_empty() { super::tty::write(bytes); }
                     done.encode += t1 - t;
                     done.write += t1.elapsed();
+                    if !bytes.is_empty() {
+                        let cost = &mut lock.lock().unwrap().cost;
+                        *cost = cost.mul_f32(0.75) + t.elapsed().mul_f32(0.25);
+                    }
                     done.latency += tag.started.elapsed();
                 }
             }

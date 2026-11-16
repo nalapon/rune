@@ -125,6 +125,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args) -> Result<(), String>
     rt.record_events = false;
     rt.open_urls_natively = true;
     // The terminal is in front when it starts the app; focus reports say when that changes.
+    super::system_preferences(&mut rt);
     rt.window_focus(true);
     rt.invalidate();
     let started = Instant::now();
@@ -242,7 +243,7 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input) -> bool {
         // down moves the content up (negative `dy`), one right moves it left.
         Input::Wheel(x, y, right, down) => rt.wheel_event(crate::WheelEvent::new(-right * WHEEL_CELLS, -down * WHEEL_CELLS).at(p(x), p(y))),
         Input::Paste(text) => rt.paste(text),
-        Input::Focus(focused) => rt.window_focus(focused),
+        Input::Focus(focused) => { super::system_preferences(rt); rt.window_focus(focused) }
         Input::Background(_) | Input::Answered => {}
         Input::Quit => return true,
     }

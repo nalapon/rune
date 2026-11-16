@@ -4,7 +4,7 @@
 //! Through shared memory nothing but a name crosses, so every frame replaces the whole image as
 //! RGBA (`a=T`): Ghostty spends far less on that than on `a=f` edits, which cost it about the same
 //! whatever their size, and than on many small images, which cost it per image. Each frame is one
-//! synchronized update.
+//! synchronized update. Through the pty, a frame's rectangles encode on threads of their own.
 
 use std::ffi::CString;
 use std::io::Write;
@@ -68,7 +68,6 @@ pub(super) struct Kitty {
     /// The image's size, once transmitted.
     shown: Option<(u32, u32)>,
     out: Vec<u8>,
-    rgb: Vec<u8>,
     b64: Vec<u8>,
     shm_seq: u64,
     pub(super) sent: Sent,
@@ -76,7 +75,7 @@ pub(super) struct Kitty {
 
 impl Kitty {
     pub(super) fn new(transport: Transport) -> Kitty {
-        Kitty { transport, shown: None, out: Vec::new(), rgb: Vec::new(), b64: Vec::new(), shm_seq: 0, sent: Sent::default() }
+        Kitty { transport, shown: None, out: Vec::new(), b64: Vec::new(), shm_seq: 0, sent: Sent::default() }
     }
 
     /// The commands that draw `patches` of a frame `size` pixels big. A frame at a new size, and
@@ -94,19 +93,20 @@ impl Kitty {
             self.transmit_shm(&keys, &patches[0].rgba)?;
             self.sent.rects += 1;
             self.sent.pixels += patches[0].rgba.len() as u64;
-        }
-        let rects = if self.transport.whole_frames() { &[][..] } else { patches };
-        for p in rects {
-            self.rgb.clear();
-            self.rgb.extend(p.rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
-            let keys = if fresh {
-                format!("a=T,f=24,s={},v={},i=1,q=2,C=1", size.0, size.1)
-            } else {
-                format!("a=f,r=1,i=1,f=24,x={},y={},s={},v={},q=2", p.rect.x, p.rect.y, p.rect.w, p.rect.h)
-            };
-            self.transmit(&keys)?;
-            self.sent.rects += 1;
-            self.sent.pixels += self.rgb.len() as u64;
+        } else {
+            // Each rectangle encodes on a thread of its own; the commands go out in order.
+            let transport = self.transport;
+            let encoded = in_parallel(patches, |p| { let rgb = rgb(&p.rgba); (rgb.len(), encode(transport, &rgb)) });
+            for (p, (pixels, payload)) in patches.iter().zip(encoded) {
+                let keys = if fresh {
+                    format!("a=T,f=24,s={},v={},i=1,q=2,C=1", size.0, size.1)
+                } else {
+                    format!("a=f,r=1,i=1,f=24,x={},y={},s={},v={},q=2", p.rect.x, p.rect.y, p.rect.w, p.rect.h)
+                };
+                self.transmit(&keys, &payload)?;
+                self.sent.rects += 1;
+                self.sent.pixels += pixels as u64;
+            }
         }
         self.out.extend_from_slice(b"\x1b[?2026l");
         self.shown = Some(size);
@@ -128,18 +128,12 @@ impl Kitty {
         Ok(())
     }
 
-    /// Appends `self.rgb` sent through the pty with the command's `keys`.
-    fn transmit(&mut self, keys: &str) -> std::io::Result<()> {
-        self.b64.clear();
+    /// Appends `payload` (from [`encode`]) sent through the pty with the command's `keys`.
+    fn transmit(&mut self, keys: &str, payload: &[u8]) -> std::io::Result<()> {
         let out = &mut self.out;
-        match self.transport {
-            Transport::Shm => unreachable!("shared memory sends whole frames"),
-            Transport::Base64 => base64(&self.rgb, &mut self.b64),
-            Transport::Zlib => base64(&miniz_oxide::deflate::compress_to_vec_zlib(&self.rgb, 1), &mut self.b64),
-        }
         let z = if self.transport == Transport::Zlib { ",o=z" } else { "" };
         // Chunks of at most 4096 base64 bytes; `m=1` on all but the last.
-        let mut chunks = self.b64.chunks(4096).peekable();
+        let mut chunks = payload.chunks(4096).peekable();
         let mut first = true;
         while let Some(chunk) = chunks.next() {
             let more = u8::from(chunks.peek().is_some());
@@ -150,6 +144,33 @@ impl Kitty {
         }
         Ok(())
     }
+}
+
+/// RGBA pixels without their alpha, as `f=24` takes them.
+fn rgb(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect()
+}
+
+/// RGB pixels as the pty carries them: base64, deflated first for [`Transport::Zlib`].
+fn encode(transport: Transport, rgb: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match transport {
+        Transport::Shm => unreachable!("shared memory sends whole frames"),
+        Transport::Base64 => base64(rgb, &mut out),
+        Transport::Zlib => base64(&miniz_oxide::deflate::compress_to_vec_zlib(rgb, 1), &mut out),
+    }
+    out
+}
+
+/// `f` over `items` on the machine's cores, results in order.
+fn in_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(4, usize::from).min(items.len());
+    if threads <= 1 { return items.iter().map(&f).collect(); }
+    let per = items.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = items.chunks(per).map(|chunk| s.spawn(|| chunk.iter().map(&f).collect::<Vec<R>>())).collect();
+        jobs.into_iter().flat_map(|j| j.join().expect("--term: encode thread")).collect()
+    })
 }
 
 impl Drop for Kitty {

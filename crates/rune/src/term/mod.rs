@@ -8,8 +8,10 @@
 //! renders, and `kitty` encodes them into the terminal's image, on `writer`'s thread. An idle app draws and sends
 //! nothing, and a frame that builds the same instances as the last (the pointer moving over
 //! nothing that reacts) renders nothing. Keys and presses draw at once; pointer moves at the
-//! frame rate, as a window's vsync paces them. `--scale` defaults to 2 when the terminal's
-//! cells are at least 30 pixels tall.
+//! frame rate, as a window's vsync paces them. Motion draws at up to 120 frames a second, and
+//! no faster than frames reach the terminal, so a slow one gets an even, lower rate. As in a
+//! window, the system's Reduce Motion setting applies. `--scale` defaults to 2 when the
+//! terminal's cells are at least 30 pixels tall.
 //!
 //! The pointer takes the shape the element under it asks for (OSC 22). Copies reach the system
 //! clipboard and the terminal's (OSC 52), and a mouse selection is copied as the drag ends.
@@ -46,7 +48,7 @@ use readback::Readback;
 use tty::{Size, Tty};
 use writer::{Unsent, Writer, Written};
 
-/// The fastest the loop draws while something moves.
+/// The fastest the loop draws while something moves (slower when frames take longer to send).
 const FRAME_GAP: Duration = Duration::from_micros(8_333);
 /// Points one wheel notch scrolls.
 const WHEEL_POINTS: f32 = 40.0;
@@ -272,6 +274,9 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
     rt.set_os_drag(false);
     rt.track_marks = comp.is_some();
     rt.record_events = false;
+    // The terminal is in front when it starts the app; focus reports say when that changes.
+    system_preferences(&mut rt);
+    rt.window_focus(true);
     let started = Instant::now();
     rt.wall_start = Some(started);
 
@@ -291,8 +296,11 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
         if quit_after.is_some_and(|d| started.elapsed() >= d) || crate::quit::quitting() { break; }
         // Wait for input, a wake, the next motion frame, a timer, or a readback in flight.
         let now = Instant::now();
+        // Motion draws no faster than frames reach the terminal, so a slow one gets an even,
+        // lower frame rate rather than whichever frames find the writer free.
+        let gap = FRAME_GAP.max(sink.writer.frame_cost().mul_f32(1.1));
         let mut timeout = if asked { Some(Duration::ZERO) }
-            else if animating || moved { Some(FRAME_GAP.saturating_sub(now - last_frame)) }
+            else if animating || moved { Some(gap.saturating_sub(now - last_frame)) }
             else { rt.wake_deadline().map(|d| Duration::from_secs_f64((d - (now - started).as_secs_f64()).max(0.0))) };
         let soonest = |t: Option<Duration>, limit: Duration| Some(t.map_or(limit, |t| t.min(limit)));
         if readback.in_flight() { timeout = soonest(timeout, Duration::from_millis(1)); }
@@ -329,7 +337,7 @@ pub(crate) fn run<S: 'static>(mut app: App<S>, args: Args, transport: Transport)
 
         let now = Instant::now();
         let due = rt.wake_deadline().is_some_and(|d| d <= (now - started).as_secs_f64());
-        if !(asked || due || (animating || moved) && now - last_frame >= FRAME_GAP) { continue; }
+        if !(asked || due || (animating || moved) && now - last_frame >= gap) { continue; }
         let stats = &mut sink.stats;
         if asked || due || moved { stats.asked += 1 } else { stats.motion += 1; stats.motion_secs += (now - last_frame).as_secs_f64() }
         (asked, moved) = (false, false);
@@ -425,10 +433,17 @@ fn apply<S: 'static>(rt: &mut Runtime<S>, input: Input, scale: f32) -> bool {
         Input::Wheel(x, y, right, down) => rt.wheel_event(crate::WheelEvent::new(-right * WHEEL_POINTS, -down * WHEEL_POINTS).at(p(x), p(y))),
         Input::Paste(text) => rt.paste(text),
         Input::Quit => return true,
-        Input::Focus(focused) => rt.window_focus(focused),
+        Input::Focus(focused) => { system_preferences(rt); rt.window_focus(focused) }
         Input::Background(_) | Input::Answered => {}
     }
     false
+}
+
+/// The system's Reduce Motion and contrast settings, read again on each focus change as a
+/// window does: with Reduce Motion, elements enter and leave on short fades instead of springs.
+pub(super) fn system_preferences<S: 'static>(rt: &mut Runtime<S>) {
+    rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
+    rt.set_system_contrast(crate::platform::preferences::contrast());
 }
 
 fn report(s: &Stats, written: &Written, (w, h): (u32, u32), scale: f32, transport: Transport, elapsed: Duration) {
